@@ -131,10 +131,24 @@ final.title = 人工智能 - Search results - Wikipedia
 - **[T14 残余] 安全演练覆盖面**：已覆盖按钮型 + 弹窗内 + 连续多个危险动作；
   未覆盖 iframe 内、以及"批准后动作本身失败"的路径。
 - **[T13 残余]** doctor 的 LLM 探测为单次尝试（刻意如此），`bad_response` 只校验 `act` 字段存在性。
+- **[T20] 强制升级的阈值是**有条件的**：`JEV_ROUTE_T` 必须**高于目标页面上 Jev 的实际 margin**
+  才会触发升级，而各页差异极大（实测）：
+  · 极简本地页（2 个候选元素）Jev margin ≈ **0.98 / 1.0** → `0.95` **不会**升级
+    （我在写 `examples/llm_stub_demo.py` 时照抄 0.95，demo 因此静默走了 Jev 自己的判断）；
+  · 真实维基百科搜索页 Jev margin ≈ **0.80 / 0.85** → `0.95` **确实**触发升级。
+  **经验规则**：强制升级的阈值取「**该页最大观测 margin 之上**」；因为 margin 上限是 1.0，
+  所以 `1.01` 在任何页面上都必然升级（本仓库的 demo 就是这么注入的）。
+  照抄 `0.95` 在简单页面上会困惑——它不是常量，是"相对该页置信度"的阈值。
 - **[T19] 真实 provider 覆盖仍薄**：stub 只覆盖"形状正确"；真实 provider 现已实测
   （维基百科搜索任务 × 2 次 + doctor 探测 × 1 次，模型 `deepseek-flash`），
   但**只覆盖单一模型、单一任务**；提示词遵从度、字段漂移、长上下文截断、
   其他 provider（OpenAI / 兼容网关）均未系统验证。
+- **[T21] 文档里缺 DeepSeek 的模型名示例**：`deepseek-chat` 已下线，现役为
+  `deepseek-flash` / `deepseek-v4-pro`；README 的 LLM 示例目前只有 OpenAI 的 `gpt-4o-mini`
+  （仍然正确），未补 DeepSeek 一行（涉及真实 provider 配置口径，待发布者确认后补）。
+- **[T22] 真实 provider 的失败路径未验证**：真实 key 下的 401/403、5xx、以及
+  "LLM 返回不可解析内容"都没有在真实 provider 上演练过（目前只有 stub/mock 覆盖）。
+  这是 T19 的具体化，单列以便跟踪。
 
 ### Notes
 

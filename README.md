@@ -379,6 +379,16 @@ C 是"逐个过门"的关键证据：安全门是**每个动作各自**过门，
     环境下跑通真实 HTTP + 真实解析 + 真实重试 + 真实主循环 + 真实 chromium 执行。
     **它本身不等于闭环**，只是让"接线"可被回归。
 
+- **[T20] 强制升级阈值是**有条件的**：`JEV_ROUTE_T` 必须**高于目标页上 Jev 的实际 margin** 才会升级。
+  实测极简本地页（2 个候选元素）Jev margin ≈ **0.98 / 1.0**，`0.95` **不触发**；
+  真实维基百科搜索页 margin ≈ **0.80 / 0.85**，`0.95` **触发**。
+  **经验规则**：阈值取「**该页最大观测 margin 之上**」——margin 上限是 1.0，故 `1.01` 必然升级
+  （`examples/llm_stub_demo.py` 即如此注入）。别把 `0.95` 当常量照抄。
+- **[T21] 未给 DeepSeek 模型名示例**：`deepseek-chat` 已下线（现役 `deepseek-flash` / `deepseek-v4-pro`）；
+  README 的 LLM 示例只有 OpenAI 的 `gpt-4o-mini`，DeepSeek 一行待补。
+- **[T22] 真实 provider 的失败路径未验证**：真实 key 下的 401/403、5xx、
+  以及 LLM 返回不可解析内容，均只在 stub/mock 中覆盖。
+
 ## License
 
 MIT
