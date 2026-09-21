@@ -266,16 +266,21 @@ def run(task, url=None, max_steps=25, headless=True, log_dir=".", session_id=Non
                                        "message": "危险动作未获人工确认：%s" % label}
                     break
 
-            if not used.act or chosen is None:
+            if not used.act:
+                # 决策压根没给出编号 → 这才是"没有动作可选"，直接收尾
                 log.append({"ts": time.time(), "session_id": session_id, "step": step,
                             "phase": "plan", "status": "no_action",
                             "decision": used.as_dict(), "label": label,
                             "snapshot": execu.snapshot()})
                 result["status"] = "no_action"
                 result["error"] = {"type": "no_action",
-                                   "message": "决策未指向任何存在的元素编号：%r" % used.act}
+                                   "message": "决策没有给出元素编号：%r" % used.act}
                 break
 
+            # 注意：`chosen is None`（编号不在候选集里）**不在这里短路**。
+            # 它是"指了一个不存在的元素"，属于执行失败，交给执行器产出统一的
+            # element_not_found 结构化错误；连续失败由下面的计数器兜到 execution_failed。
+            # 这样"给了越界编号"与"没给编号"是两种可区分的终态。
             intent = plan_intent(used, chosen, elements, pending_values[value_cursor:], task,
                                  values_provided=bool(pending_values))
             if intent["kind"] in ("fill", "dialog_search") and intent.get("value"):

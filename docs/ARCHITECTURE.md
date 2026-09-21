@@ -78,6 +78,12 @@
 LLM 的单值 `confidence` 会被折成两候选分布后复用 Jev 的 margin 口径
 （`margin = 2 * confidence − 1`），保证「margin 越高越可信」在整个系统里只有一套含义。
 
+**越界编号必须 margin = 0**：`act` 不在候选集里时（`parse_llm_answer(valid_ids=...)`），
+分布取零概率质量 `{act: 0.0, "__rest__": 0.0}`，`margin` 自然算得 0。
+早期实现只把 `confidence` 置 0，却留下 `"__rest__": 1.0`，于是 `margin` 变成 **1.0**
+——"给了不存在的元素"反而成了最高置信，现已修掉并加了回归用例。
+原始编号仍保留在 `act` 里，日志中一眼可见 LLM 到底给了什么。
+
 ## 主循环状态机
 
 ```
@@ -87,7 +93,8 @@ init → (goto URL) → 循环 {
         重试预算熔断 → upstream_unstable（写 phase="jev" + status + 熔断原因）
         其他         → error(jev_call_failed)
     done >= 0.50（当前状态已判完成）→ 写 phase="done" 记录 → finished  ← 判定在动作之前
-    决策不指向任何存在编号 → no_action
+    act 为空（没给编号）→ no_action
+    编号不在候选集（越界）→ 交给执行器 → element_not_found（连续 3 次 → execution_failed）
     危险动作且未确认 → declined_dangerous_action
     执行失败 ×3 → execution_failed
 } → 写 phase="end" 记录 → 返回
@@ -133,11 +140,19 @@ Jev 的 `done` 问的是「**结合历史操作，该任务是否已经完成**�
 | `execution` | obj | 执行器结果（见上「执行器」节结构表） |
 | `snapshot` | obj | 动作后的 `{url, title}` |
 
+### LLM 兜底（wiring 已用本地 stub 验证，真实 provider 待 key）
+
+`examples/llm_stub_demo.py` 提供只监听 127.0.0.1 的 OpenAI 兼容 stub，用于在**没有 LLM key**
+的情况下验证这条链路：真实 HTTP、真实解析、真实重试、真实主循环。它验证的是**接线**，
+不是真实模型行为（见 CHANGELOG 的 T2 两段说明与 T19）。
+
 ### 其他 phase
 
 - `phase="sense"` + `status="no_elements"`：页面没有可交互元素。
 - `phase="jev"` + `error`：Jev 调用失败（结构化错误原文）。
-- `phase="plan"` + `status="no_action"`：决策编号不存在。
+- `phase="plan"` + `status="no_action"`：决策**没有给出编号**（`act` 为空）。
+  注意"编号越界"不走这条路：它会在 `phase="act"` 记录里带 `element_not_found`，
+  两者是刻意区分开的两种终态。
 - `phase="safety"` + `status="declined_dangerous_action"`：人工拒绝，**此记录之后不会再有执行动作**。
 - `phase="done"` + `status="finished"`：当前状态已判完成（`done >= DONE_T`），本步**没有执行动作**；
   含 `decision` / `fallback` / `snapshot`。`steps` 不因这条记录增加。

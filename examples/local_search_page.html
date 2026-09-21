@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>本地搜索页（LLM stub wiring 演练用，纯离线）</title>
+</head>
+<body>
+  <h1>本地搜索页</h1>
+  <p id="status">等待搜索</p>
+
+  <!-- 输入框在前：stub 的编号选择规则会优先挑 label 含「搜索/search」的元素，
+       因此本页会选中这个输入框（fill），而不是后面的按钮。 -->
+  <p><input id="q" name="q" type="text" placeholder="搜索"></p>
+  <p><button id="go" type="button">搜索</button></p>
+
+  <script>
+    // 纯本地副作用：只改文本，不发网络请求、不跳转。
+    // 变量名避免叫 status（window.status 是字符串属性，会静默吞掉赋值）。
+    var statusEl = document.getElementById('status');
+    document.getElementById('go').addEventListener('click', function () {
+      statusEl.textContent = '已执行搜索';
+    });
+  </script>
+</body>
+</html>

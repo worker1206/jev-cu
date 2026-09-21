@@ -136,22 +136,28 @@ def parse_llm_answer(text, valid_ids=None):
     单一 confidence 折成两候选分布后复用 Jev 的 margin 口径：
     margin = confidence - (1 - confidence) = 2*confidence - 1（下限 0）。
     这样"margin 越高越可信"在整个系统里只有一套含义。
+
+    越界编号（act 不在 valid_ids 里）必须把 margin 压到 **0**：
+    它代表"LLM 给了一个根本不存在的元素"，是最不可信的情况。
+    注意不能用 `conf = 0.0` 了事——那会造出 {"999": 0.0, "__rest__": 1.0}，
+    compute_margin 取到 1.0-0.0 = **1.0**，反而变成"最高置信"（v0.1.0 实测到的缺陷）。
     """
     data = extract_json(text)
     act = str(data.get("act", "") or "").strip()
     conf = min(max(_as_float(data.get("confidence"), 0.0), 0.0), 1.0)
     done = min(max(_as_float(data.get("done"), 0.0), 0.0), 1.0)
 
-    if valid_ids is not None and act:
-        allowed = set(str(v) for v in valid_ids)
-        if act not in allowed:
-            # 越界编号会被执行器拒掉（element_not_found），此处显式降 margin，
-            # 让日志一眼看出"LLM 给了不存在的元素"。
-            conf = 0.0
+    out_of_range = bool(act) and valid_ids is not None and \
+        act not in set(str(v) for v in valid_ids)
 
-    key = act or "?"
-    probabilities = {key: conf, "__rest__": round(1.0 - conf, 6)}
-    margin = 0.0 if not act else max(0.0, compute_margin(probabilities))
+    if out_of_range:
+        # 零概率质量的分布：margin 自然算得 0，且日志里一眼可见"给了不存在的编号"
+        conf = 0.0
+        probabilities = {act: 0.0, "__rest__": 0.0}
+    else:
+        probabilities = {act or "?": conf, "__rest__": round(1.0 - conf, 6)}
+
+    margin = 0.0 if (not act or out_of_range) else max(0.0, compute_margin(probabilities))
 
     decision = Decision(
         act=act,

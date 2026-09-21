@@ -35,7 +35,11 @@
 - **纯本地安全演练**：`examples/danger_gate_demo.py`（按钮型，8 项断言）与
   `examples/danger_dialog_demo.py`（弹窗内 + 连续多个危险动作，19 项断言），
   只使用 `examples/` 下的本地 HTML，不发网络请求、不跳转。
-- **测试**：140 个用例全 mock、离线可跑；真实浏览器用例在环境不可用时 `pytest.skip`。
+- **测试**：全 mock、离线可跑；真实浏览器用例在环境不可用时 `pytest.skip`。
+- **LLM 兜底 wiring 自检（不需要任何 LLM key）**：`examples/llm_stub_demo.py`
+  用标准库起一个只监听 127.0.0.1 的 OpenAI 兼容 stub，可离线（`--fake-jev`）或叠加真实 Jev 判断，
+  验证升级链路、真实重试（`--fail-first N`）与越界编号（`--out-of-range`）；
+  `examples/local_search_page.html` 为其本地页面。
 - **CI**：`.github/workflows/ci.yml`（Python 3.9 + 3.11 跑 pytest / compileall / 凭证自查）。
 - **文档**：`README.md`（含「首次配置（快速开始）」：`cp .env.example .env` → 自行填 key →
   `jev-cu doctor` 自查 → 第一条任务；并说明 LLM_* 为可选及其 base_url 版本段要求）、
@@ -57,12 +61,30 @@
 | `margin >= 0.30` | 保留 87% 自动步，Jev 侧准确率 100% |
 | `done >= 0.50` | 终点步 3/3 命中，中段 0/12 误报 |
 
+### Fixed
+
+- **越界编号曾被算成最高置信**：LLM 返回不在候选集里的编号时，旧实现只把 `confidence` 置 0，
+  概率分布仍是 `{"999": 0.0, "__rest__": 1.0}`，`compute_margin` 取到 `1.0 - 0.0 = 1.0`
+  ——**越界反而成了"最可信"**（注释声称降 margin，代码却相反）。
+  现改为给出零概率质量分布，`margin` 归零，原始编号仍保留在 `act` 里便于排查。
+  回归用例：`test_out_of_range_act_must_not_look_confident` 等。
+- **越界编号的终态不再与"没给编号"混淆**：编号不在候选集里时交由执行器产出统一的
+  `element_not_found`（连续 3 次 → `status="execution_failed"`）；
+  只有 `act` 为空才是 `status="no_action"`。
+
 ### Known Limitations
 
 如实列出本版本**没有**解决的问题（不要当成已完成）：
 
-- **[T2] LLM 兜底无真实端到端**：本机未配置 `LLM_BASE_URL` / `LLM_API_KEY`，
-  兜底分支只有 mock 覆盖与 doctor 连通性探测；真实 LLM 接管判断的链路未验证。
+- **[T2] LLM 兜底：wiring 已验证，真实 provider 端到端待 key**（两段，别混为一谈）
+  - **wiring 已用本地 stub 验证 ✅**：`examples/llm_stub_demo.py` 起一个只监听 127.0.0.1 的
+    OpenAI 兼容 stub，跑通了**真实 HTTP 往返 + 真实 JSON 解析 + 真实重试 + 真实主循环 +
+    真实 chromium 执行 + 真实 fsync 决策日志**；断言成立：`decision.source=="llm"`、
+    `llm_fallback.used>0`、升级后 `need_llm==False`（不二次升级）、stub 首次回 503 时
+    `Decision.retries==1`。见 `tests/test_llm_wiring.py`。
+  - **真实 provider 端到端待 key ⏳**：本机未配置 `LLM_BASE_URL` / `LLM_API_KEY`，
+    **没有**用任何真实 provider 验证过"低 margin → LLM 接管"。
+    因此 T2 **尚未闭环**，stub 验证不能当作 T2 完成。
 - **[T3] MCP 真实握手未验证**：`mcp` 包要求 Python ≥ 3.10，本机 3.9 装不上。
   已验证的是"模块可 import、工具恒返回 JSON 字符串、缺包时清晰提示并退出码 2"，
   **FastMCP 的真实 stdio 握手未验证**。
@@ -78,6 +100,8 @@
 - **[T14 残余] 安全演练覆盖面**：已覆盖按钮型 + 弹窗内 + 连续多个危险动作；
   未覆盖 iframe 内、以及"批准后动作本身失败"的路径。
 - **[T13 残余]** doctor 的 LLM 探测为单次尝试（刻意如此），`bad_response` 只校验 `act` 字段存在性。
+- **[T19] stub ≠ provider**：stub 只覆盖"形状正确"的响应；真实 provider 的模型行为
+  （提示词遵从度、字段漂移、长上下文截断）未经任何验证。
 
 ### Notes
 

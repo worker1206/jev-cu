@@ -309,6 +309,23 @@ python3 examples/danger_gate_demo.py --real-jev   # 用真实 Jev API 判断（�
 python3 examples/danger_dialog_demo.py            # 弹窗内 + 连续多个危险动作（19 项断言）
 ```
 
+### LLM 兜底 wiring 自检（**不需要任何 LLM key**）
+
+`examples/llm_stub_demo.py` 用 Python 标准库起一个**只监听 127.0.0.1** 的 OpenAI 兼容 stub
+（`POST /v1/chat/completions`），把 LLM 兜底整条链路跑通：真实 HTTP 往返、真实 JSON 解析、
+真实重试、真实主循环、真实 chromium 执行、真实 fsync 决策日志。
+
+```bash
+python3 examples/llm_stub_demo.py                 # 真实 Jev 判断 + stub 兜底（需 JEV_API_KEY）
+python3 examples/llm_stub_demo.py --fake-jev      # 完全离线：不调 Jev，注入低 margin 信号
+python3 examples/llm_stub_demo.py --fail-first 1  # stub 首次回 503 → 验证真实重试
+python3 examples/llm_stub_demo.py --out-of-range  # stub 回越界编号 999 → 验证降 margin
+```
+
+**定性说明**：这是 **wiring 验证**，**不是 T2 闭环**——stub 只证明"链路与形状"，
+真实 provider 的模型行为仍待用户提供 key 后验证。stub 不落任何凭证、结束即释放端口，
+demo 用的 `LLM_API_KEY` 就是字面量 `stub`。
+
 **按钮型**（`examples/local_order_form.html`，8/8 通过）：
 
 | 场景 | 人工答复 | 结果 | 页面状态 |
@@ -350,7 +367,12 @@ C 是"逐个过门"的关键证据：安全门是**每个动作各自**过门，
   始终不去点结果链接。拆成两个单目标任务（先搜索、再打开）即可正常终止：
   单目标任务「搜索 X」在第 2 步 `done=0.63 ≥ 0.50` 正常 `finished`。
   根因即上面 T9 + T10 两条叠加。改进方向：分阶段子目标，或按任务显式指定"打开第 N 个结果"。
-- **[T2] LLM 兜底无真实端到端**：`LLM_BASE_URL`/`LLM_API_KEY` 未配置，兜底分支只有 mock 覆盖。
+- **[T2] LLM 兜底：wiring 已验证 / 真实 provider 待 key**（两段，别混为一谈）
+  - **wiring 已验证**：本地 stub（`python3 examples/llm_stub_demo.py`）跑通真实 HTTP + 真实解析
+    + 真实重试 + 真实主循环 + 真实 chromium 执行；断言 `source=="llm"`、`llm_fallback.used>0`、
+    `need_llm==False`、stub 首次 503 时 `Decision.retries==1`。
+  - **真实 provider 端到端待 key**：未用任何真实 provider 验证过"低 margin → LLM 接管"，
+    所以 **T2 未闭环**，stub 验证不能当作完成。
 
 ## License
 
