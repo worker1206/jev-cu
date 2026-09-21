@@ -182,11 +182,14 @@ def run(task, url=None, max_steps=25, headless=True, log_dir=".", session_id=Non
             try:
                 decision = jev_ask(task, elements, history)
             except Exception as exc:
+                # 如实带出重试次数与 HTTP 状态，便于区分"服务端 5xx"与"请求本身有问题"
+                error = {"type": "jev_call_failed", "message": str(exc)[:300],
+                         "retries": int(getattr(exc, "retries", 0) or 0),
+                         "status": getattr(exc, "status", None)}
                 log.append({"ts": time.time(), "session_id": session_id, "step": step,
-                            "phase": "jev", "error": {"type": "jev_call_failed",
-                                                      "message": str(exc)[:300]}})
+                            "phase": "jev", "error": error})
                 result["status"] = "error"
-                result["error"] = {"type": "jev_call_failed", "message": str(exc)[:300]}
+                result["error"] = error
                 break
 
             fallback = None

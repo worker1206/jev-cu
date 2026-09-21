@@ -157,3 +157,39 @@ Jev 的 `done` 问的是「**结合历史操作，该任务是否已经完成**�
 能力只以 **MCP 工具** 和 **SKILL.md** 两种协议对外呈现；
 `core/` 与 `universal/` 中不存在任何针对具体宿主的条件分支或宿主标识判断，
 宿主差异全部由「读环境变量」和「调用方传参」吸收。
+
+## 瞬态错误重试
+
+Jev 单步推理请求**无状态幂等**，因此服务端抖动可安全重试；4xx 是请求本身的问题，重试只会重复犯错。
+
+```
+brain_jev.ask()
+  └─ 循环：post_json() 失败时判断 is_retryable_status()
+       ├─ 429 / 5xx   → 退避 0.5s → 1.5s → 4.0s（各加 ≤25% 抖动）后重试，最多 RETRY_MAX=3 次
+       ├─ URLError    → 同上（DNS / 连接重置 / 超时等网络抖动）
+       └─ 其他 4xx    → 立即失败，不重试、不等待
+```
+
+- 成功：`Decision.retries` 记录实际重试次数（随决策日志 `decision.retries` 落盘）。
+- 失败：抛 `JevError(message, retries, status)`；主循环把 `retries` / `status` 写进
+  `phase="jev"` 记录的 `error` 字段，日志里能区分"服务端 5xx"与"请求本身有问题"。
+- 注入点：`ask(sender=..., sleep=..., max_retries=...)`，测试全 mock、不等待真实时间。
+
+## 诊断分类（`jev-cu doctor`）
+
+`probe_jev()` / `probe_llm()` 永远返回结构化 dict 且**绝不抛异常**，分类与退出码：
+
+| category | 退出码 | 触发条件 |
+|---|---|---|
+| `ok` | 0 | `GET /v1/models` 返回可解析 JSON |
+| `unknown` | 1 | 其他（含返回非 JSON 且不像登录页） |
+| `missing_key` | 2 | 无 `JEV_API_KEY`（未发起请求） |
+| `misconfigured_base_url` | 3 | 响应落在 `/login`（含跟随重定向后的 `final_url`，或 307+`Location`） |
+| `auth_failed` | 4 | 401 / 403 |
+| `service_unavailable` | 5 | 429 / 5xx |
+| `network_unreachable` | 6 | `URLError` |
+
+LLM 探测复用 `brain_llm.http_transport`（注入点 `transport`），要求模型只回 `{"act":"1"}`，
+分类 `not_configured` / `ok` / `auth_failed` / `service_unavailable` / `unreachable` / `bad_response`。
+**LLM 是可选兜底，其状态不改变 doctor 退出码**——退出码始终跟随权威的 Jev 探测结果。
+`http_transport` 把 `HTTPError` 统一换成带 `status` 的 `LlmError`，这是 LLM 分类能区分鉴权/5xx 的前提。

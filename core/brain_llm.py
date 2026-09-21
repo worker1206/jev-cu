@@ -28,6 +28,23 @@ SYSTEM_PROMPT = (
 
 REQUIRED_ENV = ("LLM_BASE_URL", "LLM_API_KEY")
 
+# doctor 连通性探测用的最小请求：只要模型回一个 JSON，就说明链路可用
+PROBE_MESSAGES = [
+    {"role": "system", "content": "只输出一个 JSON 对象，前后不要任何其他文字。"},
+    {"role": "user", "content": '请只输出 {"act":"1"}'},
+]
+
+
+class LlmError(RuntimeError):
+    """带 HTTP 状态码的 LLM 调用错误。
+
+    doctor 靠 status 区分：401/403 鉴权失败、429/5xx 服务不可用；无 status 多为响应结构异常。
+    """
+
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = None if status is None else int(status)
+
 
 def config():
     """读取 LLM 配置。只读环境变量，绝不回显 key。"""
@@ -155,11 +172,15 @@ def http_transport(cfg=None, timeout=30):
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 payload = json.load(resp)
         except urllib.error.HTTPError as exc:
-            raise RuntimeError("LLM API 返回 %s: %s" % (exc.code, exc.read()[:200])) from exc
+            try:
+                detail = exc.read()[:200]
+            except Exception:
+                detail = b""
+            raise LlmError("LLM API 返回 %s: %s" % (exc.code, detail), status=exc.code) from exc
         try:
             return payload["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
-            raise RuntimeError("LLM 响应结构异常: %s" % str(payload)[:200]) from exc
+            raise LlmError("LLM 响应结构异常: %s" % str(payload)[:200]) from exc
 
     return _call
 

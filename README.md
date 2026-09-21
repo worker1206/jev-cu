@@ -108,18 +108,51 @@ jev-cu run "填写收货信息" --url file:///tmp/order.html \
 
 退出码：`0` 完成/到达步数上限 · `1` 运行期错误（含危险动作被人工拒绝） · `2` 配置缺失（如无 `JEV_API_KEY`，返回结构化错误而非堆栈）。
 
-## 常见故障：`JEV_BASE_URL` 必须是 API 主机
+## 瞬态错误重试（5xx / 429 / 网络抖动）
+
+Jev 的单步推理请求是**无状态幂等**的，所以服务端抖动可以安全重试；而 4xx 是请求本身的问题，
+重试只会重复犯错——**一律不重试**。
+
+| 情况 | 行为 |
+|---|---|
+| `503`（如 `no healthy upstream`）/ 其他 5xx / `429` | 自动重试 |
+| `URLError`（DNS、连接重置、超时等网络抖动） | 自动重试 |
+| `400/401/403/404/422` 等 4xx | **不重试**，立即失败 |
+| 重试上限 | `JEV_RETRY_MAX`，默认 **3** 次（总尝试 = 4） |
+| 退避 | **0.5s → 1.5s → 4.0s**，每次再加 ≤25% 随机抖动（避免多进程同步重试） |
+
+重试次数如实落到两处：成功时 `Decision.retries`（随决策日志的 `decision.retries` 落盘），
+失败时 `JevError.retries` + `JevError.status`（主循环写进 `phase="jev"` 记录的 `error.retries/status`）。
+
+实测样例（2026-09-21，Jev 端真实 503 期间）：`retries=1`，退避后重试成功，
+该步 `latency=12.06s`，任务最终 `done=0.62 → finished`。
+
+## 故障诊断：`jev-cu doctor`
+
+`doctor` 不只是把错误文本打出来，而是**分类诊断**并给出对应退出码：
+
+| 退出码 | `diagnosis_code` | 含义与处置 |
+|---|---|---|
+| `0` | `ok` | 正常，端点可达（会列出 `models`） |
+| `1` | `unknown` | 未分类错误 |
+| `2` | `missing_key` | 缺 `JEV_API_KEY`：写入工作区根 `.env` |
+| `3` | `misconfigured_base_url` | `JEV_BASE_URL` 指向网页控制台而非 API 主机 |
+| `4` | `auth_failed` | `401/403`：key 无效或已过期 |
+| `5` | `service_unavailable` | `429/5xx`：**服务端故障**，稍后重试即可（代码已自动重试） |
+| `6` | `network_unreachable` | `URLError`：本机网络 / 代理 / DNS 问题 |
+
+`doctor` 还会**探测 LLM 兜底连通性**（复用 `brain_llm.http_transport` 发一条最小请求，
+要求模型只回 `{"act":"1"}`），分类为
+`not_configured` / `ok` / `auth_failed`(401,403) / `service_unavailable`(429,5xx) /
+`unreachable` / `bad_response`。
+注意：**LLM 是可选兜底，它的状态只作诊断提示，不改变 doctor 的退出码**（退出码始终跟随权威的 Jev 探测）。
+
+### 最常见的坑：`JEV_BASE_URL` 必须是 API 主机
 
 `JEV_BASE_URL` 要写 **API 主机**（`https://api.typesafe.ai`），
 不是网页控制台（`https://console.typesafe.ai`）。指错了会得到
 `Jev API 返回 307: b'/login?returnTo=%2Fv1%2Fsystemone'`——服务端把请求当成未登录，
-而 key 本身完全有效。一条命令即可分辨：
-
-```bash
-jev-cu doctor
-# {"jev_base_url": "https://console.typesafe.ai", ...,
-#  "diagnosis": ["JEV_BASE_URL 指向网页控制台而非 API 主机；应设为 https://api.typesafe.ai"]}
-```
+而 key 本身完全有效。`doctor` 会直接判为 `misconfigured_base_url`（退出码 3）。
 
 注意 `brain_jev` 的默认值本来就是正确的 API 主机，
 只有显式设置了错误的 `JEV_BASE_URL` 才会走偏——所以要么改对，要么删掉这一行。
@@ -131,6 +164,7 @@ jev-cu doctor
 | `JEV_API_KEY` | **必填**，Jev API key，只存在于工作区根 `.env` |
 | `JEV_BASE_URL` / `JEV_MODEL` | 默认 `https://api.typesafe.ai` / `jev-latest` |
 | `JEV_ROUTE_T` / `JEV_DONE_T` | 路由 / 完成阈值 |
+| `JEV_RETRY_MAX` | 瞬态错误最大重试次数，默认 `3` |
 | `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | 系统二兜底；未配置则 `available() == False`，主循环如实记录「兜底不可用」并沿用 Jev 判断 |
 
 ## 协议级接入（不绑定任何宿主）
@@ -198,15 +232,19 @@ python3 examples/danger_gate_demo.py --real-jev   # 用真实 Jev API 判断（�
 
 ## 已知局限（如实）
 
-- 样本量仍偏小（8 步 / 15 步），阈值置信区间宽，需多站点复测。
-- 未覆盖：验证码、iframe、Canvas 应用、候选元素超过 30 个的长列表页面。
-- 输入文本抽取依赖任务文本里的引号或「搜索 X」句式，复杂场景请用 `--value` 显式给出。
-- **多目标任务会震荡**（T7 实测）：任务「搜索 X **并打开词条**」在 12 步内
+- **[T5] 阈值样本量小**：8 步 / 15 步两次实测，置信区间宽，需多站点复测；
+  未覆盖验证码、iframe、Canvas 应用。
+- **[T9] 候选元素硬截断在 30 个**（`loop.run(collect_limit=30)`）：长列表页（搜索结果页、
+  商品列表）里的目标元素会被挤出候选集。实测结果页 `elements_count` 稳定钉在 30。
+  放宽会线性增加 token 成本，取舍未做——需要"结果页专用采集策略"或分页采集。
+- **[T10] 历史窗口只有 3 步**（`brain_jev.build_request` 的 `history[-3:]`）：长任务的状态感知
+  有限。本轮已让每步历史带上「键入值 + 落点 URL」，但仍未验证 3 条窗口对 10+ 步任务是否够用。
+- **[T7 残余] 多目标任务会震荡**：任务「搜索 X **并打开词条**」在 12 步内
   `done` 始终 ≤ 0.18，循环反复重填同一个搜索框、重复点「Search」按钮，
   始终不去点结果链接。拆成两个单目标任务（先搜索、再打开）即可正常终止：
   单目标任务「搜索 X」在第 2 步 `done=0.63 ≥ 0.50` 正常 `finished`。
-  根因：候选元素被截断在 30 个（结果页链接被挤掉）+ 历史信息不足以表达"搜索已完成、该点结果了"。
-  改进方向：分阶段子目标，或按任务显式指定"打开第 N 个结果"。
+  根因即上面 T9 + T10 两条叠加。改进方向：分阶段子目标，或按任务显式指定"打开第 N 个结果"。
+- **[T2] LLM 兜底无真实端到端**：`LLM_BASE_URL`/`LLM_API_KEY` 未配置，兜底分支只有 mock 覆盖。
 
 ## License
 
