@@ -393,3 +393,69 @@ def test_summarize_log_not_finished_when_no_decision_claims_it(tmp_path):
     summary = loop.summarize_log("sess-unfinished", log_dir=str(tmp_path))
     assert summary["status"] == "max_steps"
     assert summary["finished"] is False
+
+
+# ---------------------------------------------------------------- T12：熔断在主循环里的表现
+def test_loop_reports_upstream_unstable_on_budget_exhaustion(tmp_path):
+    elements = [{"idx": 1, "tag": "button", "label": "Go", "is_input": False}]
+    page = FakePage(elements=elements)
+
+    def tripped_jev(task, els, history=None, **kw):
+        raise brain_jev.JevError(
+            "Jev API 持续返回 503，重试预算耗尽已熔断：累计重试 8 次已达预算上限 8",
+            retries=3, status=503, budget_exceeded=True)
+
+    result = loop.run(task="x", page=page, max_steps=3, log_dir=str(tmp_path),
+                      session_id="sess-budget", jev_ask=tripped_jev)
+
+    assert result["status"] == "upstream_unstable"
+    assert result["error"]["type"] == "retry_budget_exceeded"
+    assert result["error"]["budget_exceeded"] is True
+    assert result["error"]["status"] == 503
+    assert result["retry_budget"]["limit"] == brain_jev.RETRY_BUDGET
+    assert page.waits == [], "熔断时不应执行任何动作"
+
+    records = loop.read_log(result["log_path"])
+    assert records[0]["phase"] == "jev"
+    assert records[0]["status"] == "upstream_unstable"
+    assert "熔断" in records[0]["error"]["message"]
+    assert records[0]["retry_budget"]["limit"] == brain_jev.RETRY_BUDGET
+
+
+def test_loop_passes_one_shared_budget_to_brain(tmp_path):
+    """预算必须是**整个 session 共享**的同一个对象，否则跨步累计无从谈起。"""
+    elements = [{"idx": 1, "tag": "button", "label": "Go", "is_input": False}]
+    page = FakePage(elements=elements)
+    seen = []
+
+    def capture_jev(task, els, history=None, **kw):
+        seen.append(kw.get("budget"))
+        raise brain_jev.JevError("stop", retries=0)
+
+    loop.run(task="x", page=page, max_steps=3, log_dir=str(tmp_path),
+             session_id="sess-shared", jev_ask=capture_jev)
+
+    assert len(seen) == 1
+    assert isinstance(seen[0], brain_jev.RetryBudget)
+    assert seen[0].limit == brain_jev.RETRY_BUDGET
+
+
+def test_loop_records_retries_and_status_on_jev_failure(tmp_path):
+    elements = [{"idx": 1, "tag": "button", "label": "Go", "is_input": False}]
+    page = FakePage(elements=elements)
+
+    def failing_jev(task, els, history=None, **kw):
+        raise brain_jev.JevError("Jev API 返回 503: no healthy upstream（已重试 3 次）",
+                                 retries=3, status=503)
+
+    result = loop.run(task="x", page=page, max_steps=3, log_dir=str(tmp_path),
+                      session_id="sess-exhausted", jev_ask=failing_jev)
+
+    assert result["status"] == "error"                 # 非熔断的普通失败仍是 error
+    assert result["error"]["retries"] == 3
+    assert result["error"]["status"] == 503
+    assert result["error"]["budget_exceeded"] is False
+    records = loop.read_log(result["log_path"])
+    assert records[0]["phase"] == "jev"
+    assert records[0]["status"] == "error"
+    assert records[0]["error"]["retries"] == 3

@@ -200,3 +200,101 @@ def test_retries_visible_in_decision_dict():
 
     clean = ask(Sender([OK_PAYLOAD]), [])
     assert clean.as_dict()["retries"] == 0
+
+
+# ---------------------------------------------------------------- T12：重试总预算 + 熔断
+def test_retry_budget_default_is_eight():
+    assert brain_jev.RETRY_BUDGET == 8
+    assert brain_jev.RetryBudget().limit == 8
+    assert brain_jev.RetryBudget().tripped is False
+
+
+def test_budget_allows_retries_within_limit():
+    slept = []
+    budget = brain_jev.RetryBudget(limit=8)
+    sender = Sender([lambda: http_error(503), OK_PAYLOAD])
+
+    decision = ask(sender, slept, budget=budget)
+
+    assert decision.retries == 1
+    assert budget.spent == 1
+    assert budget.tripped is False
+    assert budget.as_dict() == {"limit": 8, "spent": 1, "tripped": False, "reason": None}
+
+
+def test_budget_accumulates_across_calls():
+    budget = brain_jev.RetryBudget(limit=8)
+    for _ in range(3):
+        ask(Sender([lambda: http_error(503), OK_PAYLOAD]), [], budget=budget)
+
+    assert budget.spent == 3            # 跨步累计，而不是每次调用各自计数
+    assert budget.tripped is False
+
+
+def test_budget_trips_and_marks_error_as_budget_exceeded():
+    slept = []
+    budget = brain_jev.RetryBudget(limit=2)
+    sender = Sender([lambda: http_error(503, b"no healthy upstream")])
+
+    with pytest.raises(brain_jev.JevError) as excinfo:
+        ask(sender, slept, budget=budget)
+
+    error = excinfo.value
+    assert error.budget_exceeded is True
+    assert budget.tripped is True
+    assert budget.spent == 2
+    assert sender.calls == 3            # 首发 1 次 + 预算内 2 次重试，第 3 次重试前熔断
+    assert len(slept) == 2
+    assert "预算" in str(error)
+    assert "熔断" in str(error)
+    assert budget.as_dict()["reason"] and "预算上限" in budget.as_dict()["reason"]
+
+
+def test_circuit_breaker_stops_sending_requests_after_trip():
+    budget = brain_jev.RetryBudget(limit=2)
+    with pytest.raises(brain_jev.JevError):
+        ask(Sender([lambda: http_error(503)]), [], budget=budget)
+    assert budget.tripped is True
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("熔断后不应再发请求")
+
+    with pytest.raises(brain_jev.JevError) as excinfo:
+        ask(forbidden, [], budget=budget)
+
+    assert excinfo.value.budget_exceeded is True
+    assert excinfo.value.retries == 0
+    assert "熔断" in str(excinfo.value)
+
+
+def test_budget_zero_trips_immediately_without_any_request():
+    slept = []
+    budget = brain_jev.RetryBudget(limit=0)
+    sender = Sender([OK_PAYLOAD])
+    assert budget.tripped is True
+
+    with pytest.raises(brain_jev.JevError) as excinfo:
+        ask(sender, slept, budget=budget)
+
+    assert sender.calls == 0
+    assert slept == []
+    assert excinfo.value.budget_exceeded is True
+
+
+def test_budget_trips_on_url_error_too():
+    slept = []
+    budget = brain_jev.RetryBudget(limit=1)
+    sender = Sender([urllib.error.URLError("dns fail")])
+
+    with pytest.raises(brain_jev.JevError) as excinfo:
+        ask(sender, slept, budget=budget)
+
+    assert excinfo.value.budget_exceeded is True
+    assert budget.tripped is True
+    assert "网络" in str(excinfo.value)
+
+
+def test_no_budget_keeps_previous_behaviour():
+    slept = []
+    decision = ask(Sender([lambda: http_error(503), OK_PAYLOAD]), slept)
+    assert decision.retries == 1        # 不传 budget 时不熔断、行为不变

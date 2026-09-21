@@ -38,19 +38,55 @@ DONE_T = _env_float("JEV_DONE_T", 0.50)     # done 概率高于此值 -> 任务�
 
 # 瞬态错误重试：Jev 推理请求是无状态幂等的，5xx/429/网络抖动可以安全重试。
 # 4xx（除 429）是请求本身的问题，重试只会重复犯错 —— 一律不重试。
-RETRY_MAX = _env_int("JEV_RETRY_MAX", 3)              # 最多重试次数（总尝试 = 1 + RETRY_MAX）
+# 这一套口径（可重试判定 + 退避表 + 抖动）由 Jev 与 LLM 两条链路共用，见 brain_llm 的 import。
+RETRY_MAX = _env_int("JEV_RETRY_MAX", 3)              # 单次调用最多重试次数（总尝试 = 1 + RETRY_MAX）
 RETRY_SCHEDULE = (0.5, 1.5, 4.0)                      # 指数退避基数，实际值再加 ≤25% 抖动
 RETRY_JITTER = 0.25                                   # 抖动比例，避免多进程同步重试
 RETRYABLE_STATUS = (429,)
+RETRY_BUDGET = _env_int("JEV_RETRY_BUDGET", 8)        # 单个 session 累计重试上限，超过即熔断
 
 
 class JevError(RuntimeError):
     """带重试次数与 HTTP 状态码的 Jev 调用错误（便于日志与诊断分类）。"""
 
-    def __init__(self, message, retries=0, status=None):
+    def __init__(self, message, retries=0, status=None, budget_exceeded=False):
         super().__init__(message)
         self.retries = int(retries)
         self.status = status
+        self.budget_exceeded = bool(budget_exceeded)
+
+
+class RetryBudget:
+    """单个 session 的重试总预算 + 熔断。
+
+    没有它时，一个 503 风暴会让**每一步**都各自退避重试，任务总时长被无限拉长：
+    每步最多 3 次重试 ≈ 6s 退避，25 步任务最坏能多等 150s 且仍在失败。
+    因此累计重试次数一旦触顶就熔断：不再重试、不再发新请求，由主循环给出
+    `status="upstream_unstable"`（上游不稳定），把"服务端有问题"与"我的请求有问题"区分开。
+    """
+
+    def __init__(self, limit=None):
+        self.limit = RETRY_BUDGET if limit is None else max(0, int(limit))
+        self.spent = 0
+        self.tripped = self.limit == 0
+        self.reason = "预算上限为 0，禁止任何重试" if self.tripped else None
+
+    def allow(self):
+        """还能再重试吗？"""
+        return not self.tripped and self.spent < self.limit
+
+    def spend(self, n=1):
+        """记一次重试；触顶即熔断并留下原因。"""
+        self.spent += int(n)
+        if self.spent >= self.limit:
+            self.tripped = True
+            self.reason = "累计重试 %d 次已达预算上限 %d，熔断以避免任务时间无限拉长" % (
+                self.spent, self.limit)
+        return self.tripped
+
+    def as_dict(self):
+        return {"limit": self.limit, "spent": self.spent, "tripped": self.tripped,
+                "reason": self.reason}
 
 
 def is_retryable_status(code):
@@ -161,12 +197,15 @@ def _read_error_body(exc):
 
 
 def ask(task, elements, history=None, model=None, api_key=None, base_url=None, timeout=30,
-        sender=None, sleep=None, max_retries=None):
+        sender=None, sleep=None, max_retries=None, budget=None):
     """调用 Jev。api_key 缺省读环境变量 JEV_API_KEY。
 
     瞬态错误（5xx / 429 / URLError 网络抖动）自动有界重试：最多 RETRY_MAX 次，
     退避 0.5s/1.5s/4.0s（带 ≤25% 抖动）。4xx（除 429）不重试。
     实际重试次数记录在 `Decision.retries`（成功）或 `JevError.retries`（失败）里。
+
+    budget 为跨步共享的 `RetryBudget`：累计重试触顶即熔断，抛带
+    `budget_exceeded=True` 的 JevError；已熔断的预算下**不再发起任何请求**。
 
     sender / sleep 可注入以便 mock：sender(url, body, headers, timeout) -> dict，
     sleep(seconds) -> None。
@@ -181,6 +220,12 @@ def ask(task, elements, history=None, model=None, api_key=None, base_url=None, t
     send = sender or post_json
     nap = sleep or time.sleep
     limit = RETRY_MAX if max_retries is None else max(0, int(max_retries))
+
+    # 熔断闸门：预算已熔断时直接失败，避免继续往不健康的上游打请求
+    if budget is not None and budget.tripped:
+        raise JevError(
+            "重试预算已熔断，拒绝发起新请求：%s" % (budget.reason or "预算耗尽"),
+            retries=0, budget_exceeded=True)
 
     started = time.time()
     retries = 0
@@ -197,15 +242,29 @@ def ask(task, elements, history=None, model=None, api_key=None, base_url=None, t
                     "Jev API 返回 %s: %s%s" % (status, detail,
                                                "（已重试 %d 次）" % retries if retries else ""),
                     retries=retries, status=status) from exc
+            if budget is not None and not budget.allow():
+                raise JevError(
+                    "Jev API 持续返回 %s，重试预算耗尽已熔断：%s"
+                    % (status, budget.reason or "预算耗尽"),
+                    retries=retries, status=status, budget_exceeded=True) from exc
             nap(backoff_seconds(retries))
             retries += 1
+            if budget is not None:
+                budget.spend()
         except urllib.error.URLError as exc:
             if retries >= limit:
                 raise JevError(
                     "Jev API 网络不可达（已重试 %d 次）: %s" % (retries, exc.reason),
                     retries=retries) from exc
+            if budget is not None and not budget.allow():
+                raise JevError(
+                    "Jev API 网络持续不可达，重试预算耗尽已熔断：%s"
+                    % (budget.reason or "预算耗尽"),
+                    retries=retries, budget_exceeded=True) from exc
             nap(backoff_seconds(retries))
             retries += 1
+            if budget is not None:
+                budget.spend()
 
     decision = parse_answer(payload, latency=time.time() - started)
     decision.retries = retries

@@ -17,8 +17,21 @@ import urllib.error
 import urllib.request
 
 from core.brain_jev import DONE_T, Decision, compute_margin
+# 重试口径**直接复用** brain_jev 的那一套：同一张退避表、同一个抖动比例、
+# 同一个可重试判定函数。两条链路必须口径一致，否则"可重试"的含义会分裂。
+from core.brain_jev import RETRY_JITTER, RETRY_SCHEDULE, backoff_seconds, is_retryable_status
 
 DEFAULT_MODEL = "gpt-4o-mini"
+
+
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+LLM_RETRY_MAX = _env_int("LLM_RETRY_MAX", 3)   # 单次 LLM 调用最多重试次数
 
 SYSTEM_PROMPT = (
     "你是网页操作决策器（系统二），只负责在候选元素中挑选下一步要操作的一个元素。"
@@ -41,9 +54,11 @@ class LlmError(RuntimeError):
     doctor 靠 status 区分：401/403 鉴权失败、429/5xx 服务不可用；无 status 多为响应结构异常。
     """
 
-    def __init__(self, message, status=None):
+    def __init__(self, message, status=None, retries=0, budget_exceeded=False):
         super().__init__(message)
         self.status = None if status is None else int(status)
+        self.retries = int(retries)
+        self.budget_exceeded = bool(budget_exceeded)
 
 
 def config():
@@ -151,11 +166,21 @@ def parse_llm_answer(text, valid_ids=None):
     return decision
 
 
-def http_transport(cfg=None, timeout=30):
-    """默认传输层：OpenAI 兼容 POST {base_url}/chat/completions。"""
-    cfg = cfg or config()
+def http_transport(cfg=None, timeout=30, max_retries=None, sleep=None, budget=None, stats=None):
+    """默认传输层：OpenAI 兼容 POST {base_url}/chat/completions。
 
-    def _call(messages, model):
+    与 Jev 链路**同一套重试口径**：429/5xx/URLError 有界重试（默认 LLM_RETRY_MAX=3，
+    退避 0.5s/1.5s/4.0s + ≤25% 抖动），4xx（除 429）不重试。
+    budget 为跨步共享的 RetryBudget；已熔断时直接失败，不再发请求。
+    stats 是可选的可变 dict，成功后回填 {"retries": n}（返回值是文本，只能这样带出来）。
+
+    doctor 的连通性探测请传 max_retries=0（探测刻意保持单次尝试，见 probe_llm）。
+    """
+    cfg = cfg or config()
+    nap = sleep or time.sleep
+    limit = LLM_RETRY_MAX if max_retries is None else max(0, int(max_retries))
+
+    def _post(messages, model):
         body = json.dumps(
             {"model": model, "messages": messages, "temperature": 0}
         ).encode("utf-8")
@@ -168,34 +193,82 @@ def http_transport(cfg=None, timeout=30):
             },
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                payload = json.load(resp)
-        except urllib.error.HTTPError as exc:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.load(resp)
+
+    def _call(messages, model):
+        if budget is not None and budget.tripped:
+            raise LlmError("重试预算已熔断，拒绝发起新请求：%s"
+                           % (budget.reason or "预算耗尽"), budget_exceeded=True)
+        retries = 0
+        while True:
             try:
-                detail = exc.read()[:200]
-            except Exception:
-                detail = b""
-            raise LlmError("LLM API 返回 %s: %s" % (exc.code, detail), status=exc.code) from exc
+                payload = _post(messages, model)
+                break
+            except urllib.error.HTTPError as exc:
+                # HTTPError 是 URLError 的子类，必须先捕获
+                try:
+                    detail = exc.read()[:200]
+                except Exception:
+                    detail = b""
+                if not is_retryable_status(exc.code) or retries >= limit:
+                    raise LlmError("LLM API 返回 %s: %s%s" % (
+                        exc.code, detail,
+                        "（已重试 %d 次）" % retries if retries else ""),
+                        status=exc.code, retries=retries) from exc
+                if budget is not None and not budget.allow():
+                    raise LlmError(
+                        "LLM API 持续返回 %s，重试预算耗尽已熔断：%s"
+                        % (exc.code, budget.reason or "预算耗尽"),
+                        status=exc.code, retries=retries, budget_exceeded=True) from exc
+                nap(backoff_seconds(retries))
+                retries += 1
+                if budget is not None:
+                    budget.spend()
+            except urllib.error.URLError as exc:
+                if retries >= limit:
+                    raise LlmError("LLM 网络不可达（已重试 %d 次）: %s" % (retries, exc.reason),
+                                   retries=retries) from exc
+                if budget is not None and not budget.allow():
+                    raise LlmError(
+                        "LLM 网络持续不可达，重试预算耗尽已熔断：%s"
+                        % (budget.reason or "预算耗尽"),
+                        retries=retries, budget_exceeded=True) from exc
+                nap(backoff_seconds(retries))
+                retries += 1
+                if budget is not None:
+                    budget.spend()
+
         try:
-            return payload["choices"][0]["message"]["content"]
+            text = payload["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise LlmError("LLM 响应结构异常: %s" % str(payload)[:200]) from exc
+        if stats is not None:
+            stats["retries"] = retries
+        return text
 
     return _call
 
 
-def ask(task, elements, history=None, transport=None, cfg=None, timeout=30, model=None):
-    """调用 LLM 兜底。transport 可注入以便 mock：callable(messages, model) -> str。"""
+def ask(task, elements, history=None, transport=None, cfg=None, timeout=30, model=None,
+        budget=None, sleep=None, max_retries=None):
+    """调用 LLM 兜底。transport 可注入以便 mock：callable(messages, model) -> str。
+
+    未注入 transport 时走 http_transport（带与 Jev 同口径的有界重试与预算熔断）；
+    重试次数从 stats 回填到 `Decision.retries`（注入式 transport 不重试，记 0）。
+    """
     cfg = cfg or config()
+    stats = {}
     if transport is None:
         missing = missing_env(cfg)
         if missing:
             raise RuntimeError("LLM 兜底未配置：缺少 %s" % ", ".join(missing))
-        transport = http_transport(cfg, timeout=timeout)
+        transport = http_transport(cfg, timeout=timeout, max_retries=max_retries,
+                                   sleep=sleep, budget=budget, stats=stats)
     messages = build_messages(task, elements, history)
     started = time.time()
     text = transport(messages, model or cfg["model"])
     decision = parse_llm_answer(text, valid_ids=[e.get("idx") for e in elements])
     decision.latency = round(time.time() - started, 3)
+    decision.retries = int(stats.get("retries", 0))
     return decision

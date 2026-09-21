@@ -299,3 +299,66 @@ def test_http_transport_maps_httperror_to_llmerror(monkeypatch):
 
     assert excinfo.value.status == 401
     assert not isinstance(excinfo.value, urllib.error.HTTPError)
+
+
+# ---------------------------------------------------------------- T13：探测的字段校验
+def test_probe_llm_bad_response_no_json_vs_missing_act(monkeypatch):
+    _set_llm_env(monkeypatch)
+
+    no_json = cli.probe_llm(transport=lambda messages, model: "你好，我不输出 JSON")
+    missing_act = cli.probe_llm(transport=lambda messages, model: '{"confidence": 0.9}')
+
+    assert no_json["category"] == "bad_response" and no_json["reason"] == "no_json"
+    assert missing_act["category"] == "bad_response" and missing_act["reason"] == "missing_act"
+    assert no_json["ok"] is False and missing_act["ok"] is False
+    assert no_json["hint"] != missing_act["hint"]        # 两类处置不同，提示必须不同
+    assert "没有返回 JSON" in no_json["hint"]
+    assert "缺少 act" in missing_act["hint"]
+    assert missing_act["http"] is None
+
+
+def test_probe_llm_ok_reports_act(monkeypatch):
+    _set_llm_env(monkeypatch)
+    report = cli.probe_llm(transport=lambda messages, model: '{"act":"3"}')
+    assert report["category"] == "ok"
+    assert report["reason"] is None
+    assert report["reply"] == "3"
+
+
+def test_probe_llm_act_blank_counts_as_missing(monkeypatch):
+    _set_llm_env(monkeypatch)
+    report = cli.probe_llm(transport=lambda messages, model: '{"act":"   "}')
+    assert report["category"] == "bad_response"
+    assert report["reason"] == "missing_act"
+
+
+class _FakeResp:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def read(self):
+        import json as _json
+        return _json.dumps(self.payload).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+def test_probe_llm_is_single_attempt_no_retry(monkeypatch):
+    """探测刻意不重试：体检要如实反映"此刻通不通"，重试会把瞬时故障掩盖成正常。"""
+    _set_llm_env(monkeypatch)
+    state = {"calls": 0}
+
+    def fake_urlopen(request, timeout=None):
+        state["calls"] += 1
+        raise http_error(503, b"no healthy upstream", url="https://llm.invalid/v1/chat/completions")
+
+    monkeypatch.setattr(brain_llm.urllib.request, "urlopen", fake_urlopen)
+
+    report = cli.probe_llm()
+
+    assert report["category"] == "service_unavailable"
+    assert state["calls"] == 1          # 只尝试一次，没有退避重试

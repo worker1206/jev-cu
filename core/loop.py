@@ -135,6 +135,8 @@ def run(task, url=None, max_steps=25, headless=True, log_dir=".", session_id=Non
     jev_ask = jev_ask or brain_jev.ask
     llm_ask = llm_ask or brain_llm.ask
     llm_ready = brain_llm.available()
+    # 单个 session 的重试总预算：跨步累计，触顶即熔断（避免 503 风暴把任务时间无限拉长）
+    budget = brain_jev.RetryBudget()
 
     result = {
         "schema_version": SCHEMA_VERSION,
@@ -146,6 +148,7 @@ def run(task, url=None, max_steps=25, headless=True, log_dir=".", session_id=Non
         "log_path": log.path,
         "llm_fallback": {"available": llm_ready, "used": 0,
                          "missing": [] if llm_ready else brain_llm.missing_env()},
+        "retry_budget": budget.as_dict(),
         "final": {"url": "", "title": ""},
         "error": None,
     }
@@ -180,15 +183,22 @@ def run(task, url=None, max_steps=25, headless=True, log_dir=".", session_id=Non
                 break
 
             try:
-                decision = jev_ask(task, elements, history)
+                decision = jev_ask(task, elements, history, budget=budget)
             except Exception as exc:
                 # 如实带出重试次数与 HTTP 状态，便于区分"服务端 5xx"与"请求本身有问题"
-                error = {"type": "jev_call_failed", "message": str(exc)[:300],
+                exceeded = bool(getattr(exc, "budget_exceeded", False))
+                error = {"type": "retry_budget_exceeded" if exceeded else "jev_call_failed",
+                         "message": str(exc)[:300],
                          "retries": int(getattr(exc, "retries", 0) or 0),
-                         "status": getattr(exc, "status", None)}
+                         "status": getattr(exc, "status", None),
+                         "budget_exceeded": exceeded}
+                # 熔断时给出专门的 status，把"上游不稳定"与"我的请求有问题"区分开，
+                # 并把熔断原因（累计重试数/上限）写进日志。
                 log.append({"ts": time.time(), "session_id": session_id, "step": step,
-                            "phase": "jev", "error": error})
-                result["status"] = "error"
+                            "phase": "jev",
+                            "status": "upstream_unstable" if exceeded else "error",
+                            "error": error, "retry_budget": budget.as_dict()})
+                result["status"] = "upstream_unstable" if exceeded else "error"
                 result["error"] = error
                 break
 
@@ -197,16 +207,32 @@ def run(task, url=None, max_steps=25, headless=True, log_dir=".", session_id=Non
             if decision.need_llm:
                 if llm_ready:
                     try:
-                        used = llm_ask(task, elements, history)
+                        used = llm_ask(task, elements, history, budget=budget)
                         fallback = {"used": True, "ok": True, "source": "llm"}
                         result["llm_fallback"]["used"] += 1
                     except Exception as exc:
                         fallback = {"used": True, "ok": False,
                                     "error": {"type": type(exc).__name__,
-                                              "message": str(exc)[:300]}}
+                                              "message": str(exc)[:300],
+                                              "retries": int(getattr(exc, "retries", 0) or 0),
+                                              "status": getattr(exc, "status", None),
+                                              "budget_exceeded": bool(
+                                                  getattr(exc, "budget_exceeded", False))}}
                 else:
                     fallback = {"used": False, "reason": "not_configured",
                                 "missing": brain_llm.missing_env()}
+
+            # 兜底路径把预算打熔断了：上游已不可信，本 session 立即以 upstream_unstable 收尾，
+            # 不再拿一个低 margin 的 Jev 判断去执行动作。
+            if (fallback and fallback.get("used") and not fallback.get("ok")
+                    and (fallback.get("error") or {}).get("budget_exceeded")):
+                exceeded = dict(fallback["error"], type="retry_budget_exceeded")
+                log.append({"ts": time.time(), "session_id": session_id, "step": step,
+                            "phase": "llm", "status": "upstream_unstable",
+                            "error": exceeded, "retry_budget": budget.as_dict()})
+                result["status"] = "upstream_unstable"
+                result["error"] = exceeded
+                break
 
             # 完成判定发生在动作**之前**：Jev 的问题是"结合历史，任务是否已经完成"，
             # 问的是**当前**状态。当前状态已判完成就必须立即终止，绝不能再执行一个动作，
@@ -297,12 +323,18 @@ def run(task, url=None, max_steps=25, headless=True, log_dir=".", session_id=Non
 
         snap = execu.snapshot()
         result["final"] = snap
+        result["retry_budget"] = budget.as_dict()
         log.append({"ts": time.time(), "session_id": session_id, "phase": "end",
-                    "status": result["status"], "steps": result["steps"], "snapshot": snap})
+                    "status": result["status"], "steps": result["steps"],
+                    "retry_budget": budget.as_dict(), "snapshot": snap})
         closed = True
     except Exception as exc:
         result["status"] = "error"
         result["error"] = {"type": type(exc).__name__, "message": str(exc)[:300]}
+        try:
+            result["retry_budget"] = budget.as_dict()
+        except Exception:
+            pass
         try:
             log.append({"ts": time.time(), "session_id": session_id, "phase": "end",
                         "status": "error",

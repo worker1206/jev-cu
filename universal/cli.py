@@ -205,18 +205,21 @@ def probe_llm(cfg=None, timeout=15, transport=None):
     """复用 brain_llm.http_transport 发一条最小请求并归类。绝不抛异常。
 
     分类：not_configured / ok / auth_failed(401,403) / service_unavailable(429,5xx)
-          / unreachable(URLError) / bad_response(没按 JSON 回)。
+          / unreachable(URLError) / bad_response（再细分 reason: no_json / missing_act）。
+
+    探测刻意**保持单次尝试**（`max_retries=0`）：体检要如实反映"此刻通不通"，
+    重试会把一次瞬时故障掩盖成"正常"，也会让 doctor 变慢。真实调用链才有重试。
     """
     cfg = cfg or brain_llm.config()
     missing = brain_llm.missing_env(cfg)
     report = {"configured": not missing, "ok": False, "category": "not_configured",
               "missing": missing, "model": cfg.get("model"), "http": None,
-              "latency": None, "reply": None, "error": None, "hint": ""}
+              "latency": None, "reply": None, "reason": None, "error": None, "hint": ""}
     if missing:
         report["hint"] = "LLM 兜底未配置（可选）：缺少 %s" % ", ".join(missing)
         return report
 
-    send = transport or brain_llm.http_transport(cfg, timeout=timeout)
+    send = transport or brain_llm.http_transport(cfg, timeout=timeout, max_retries=0)
     started = time.time()
     try:
         text = send(brain_llm.PROBE_MESSAGES, cfg["model"])
@@ -240,13 +243,24 @@ def probe_llm(cfg=None, timeout=15, transport=None):
         return report
 
     report["latency"] = round(time.time() - started, 3)
+
+    # 字段校验分两级：完全没有 JSON ≠ 有 JSON 但缺 act —— 两者处置完全不同，
+    # 前者多半是协议/端点不对，后者多半是模型没按提示词输出（或不是决策模型）。
     try:
-        decision = brain_llm.parse_llm_answer(text)
+        data = brain_llm.extract_json(text)
     except ValueError as exc:
-        report.update(category="bad_response", error=str(exc)[:200],
-                      hint="LLM 可达但未按 JSON 回复（模型或协议不匹配）")
+        report.update(category="bad_response", reason="no_json", error=str(exc)[:200],
+                      hint="LLM 可达但没有返回 JSON（端点或协议不匹配，请核对 LLM_BASE_URL）")
         return report
-    report.update(ok=True, category="ok", reply=decision.act or None, hint="LLM 兜底可达")
+
+    act = str(data.get("act", "") or "").strip()
+    if not act:
+        report.update(category="bad_response", reason="missing_act",
+                      error="JSON 缺少 act 字段：%s" % json.dumps(data, ensure_ascii=False)[:160],
+                      hint="LLM 返回的是 JSON 但缺少 act 字段（提示词不匹配，或该模型不是决策模型）")
+        return report
+
+    report.update(ok=True, category="ok", reason=None, reply=act, hint="LLM 兜底可达")
     return report
 
 

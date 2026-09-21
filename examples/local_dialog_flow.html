@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>本地弹窗流程（危险动作演练用，纯离线）</title>
+  <style>
+    #dialog { display: none; border: 2px solid #888; padding: 12px; margin: 12px 0; }
+    #dialog.open { display: block; }
+  </style>
+</head>
+<body>
+  <h1>本地弹窗流程</h1>
+  <p id="status">对话框已关闭</p>
+
+  <!-- 常驻可见输入框：让"页面上存在输入框"，从而不触发 dialog_search 启发式，
+       本页要演的是"点开弹窗后在弹窗里操作"，流程必须显式。 -->
+  <p><label>备注 <input id="note" name="note" type="text" placeholder="备注"></label></p>
+
+  <p><button id="open-msg" type="button">打开留言对话框</button></p>
+
+  <div id="dialog" role="dialog">
+    <p><input id="message" name="message" type="text" placeholder="留言内容"></p>
+    <p>
+      <button id="send-msg" type="button">发送留言</button>
+      <button id="close-dlg" type="button">关闭</button>
+    </p>
+  </div>
+
+  <p id="draft">草稿内容：待发送的留言</p>
+  <p><button id="delete-draft" type="button">删除草稿</button></p>
+
+  <script>
+    // 纯本地副作用：只改文本与 class，不做任何网络请求、不跳转。
+    var dialog = document.getElementById('dialog');
+    // 千万不要叫 status：window.status 是字符串属性，
+    // var status = <element> 会被强制转成 "[object HTMLParagraphElement]"，
+    // 于是 statusEl.textContent = ... 变成静默空操作。
+    var statusEl = document.getElementById('status');
+    document.getElementById('open-msg').addEventListener('click', function () {
+      dialog.classList.add('open');
+      statusEl.textContent = '对话框已打开';
+    });
+    document.getElementById('close-dlg').addEventListener('click', function () {
+      dialog.classList.remove('open');
+      statusEl.textContent = '对话框已关闭';
+    });
+    document.getElementById('send-msg').addEventListener('click', function () {
+      dialog.classList.remove('open');
+      statusEl.textContent = '留言已发送';
+    });
+    document.getElementById('delete-draft').addEventListener('click', function () {
+      document.getElementById('draft').textContent = '草稿已删除';
+      statusEl.textContent = '草稿已删除';
+    });
+  </script>
+</body>
+</html>

@@ -8,6 +8,10 @@
   （要往输入框里填的字符串）。
 - **安全门**：凡危险动作（提交/支付/删除/发送…）无条件要求人工确认，与置信度无关。
 
+**两句话说完交付形态**：能力只以 **MCP（stdio）** 与 **SKILL.md** 两种协议对外暴露，
+代码里不存在任何宿主分支（没有 `if host == ...` 之类判断）——**不绑定任何宿主**。
+真实站点的实测数据见下面「实测数据」表（单步 87.5%、多步 93.3%、1.03s/步、913 tok/步）。
+
 ## 为什么用 margin，而不是 confidence
 
 实测踩过的坑：出现过 `confidence=1.32` 但概率分布几乎平局（`margin≈0.02`）的失真样本。
@@ -118,14 +122,32 @@ Jev 的单步推理请求是**无状态幂等**的，所以服务端抖动可以
 | `503`（如 `no healthy upstream`）/ 其他 5xx / `429` | 自动重试 |
 | `URLError`（DNS、连接重置、超时等网络抖动） | 自动重试 |
 | `400/401/403/404/422` 等 4xx | **不重试**，立即失败 |
-| 重试上限 | `JEV_RETRY_MAX`，默认 **3** 次（总尝试 = 4） |
+| 单次调用重试上限 | Jev 用 `JEV_RETRY_MAX`、LLM 用 `LLM_RETRY_MAX`，默认都是 **3** 次（总尝试 = 4） |
 | 退避 | **0.5s → 1.5s → 4.0s**，每次再加 ≤25% 随机抖动（避免多进程同步重试） |
+| session 级总预算 | `JEV_RETRY_BUDGET`，默认 **8** 次重试/任务，触顶即熔断 |
+
+**两条链路共用同一套口径**：`brain_llm` 直接复用 `brain_jev` 的
+`is_retryable_status` / `backoff_seconds` / `RETRY_SCHEDULE` / `RETRY_JITTER`
+（同一个函数对象、同一张退避表），不存在"Jev 会重试、LLM 不会"的口径分裂。
 
 重试次数如实落到两处：成功时 `Decision.retries`（随决策日志的 `decision.retries` 落盘），
-失败时 `JevError.retries` + `JevError.status`（主循环写进 `phase="jev"` 记录的 `error.retries/status`）。
+失败时 `JevError.retries` / `LlmError.retries` + `.status`
+（主循环写进 `phase="jev"` 或 `fallback.error` 的 `retries/status`）。
 
 实测样例（2026-09-21，Jev 端真实 503 期间）：`retries=1`，退避后重试成功，
 该步 `latency=12.06s`，任务最终 `done=0.62 → finished`。
+
+### 重试总预算与熔断（`status="upstream_unstable"`）
+
+单次重试上限拦不住 **503 风暴**：每一步各自退避重试 ≈ 6s，25 步任务最坏能多等 150s 还在失败。
+因此增加 **session 级重试总预算**：累计重试次数达到 `JEV_RETRY_BUDGET`（默认 8）即熔断——
+
+1. 停止重试，不再发起任何新请求（硬闸门，`RetryBudget.tripped` 一置位就拒绝发送）；
+2. 主循环以 `status="upstream_unstable"` 收尾（**不是** `error`），
+   把"上游不稳定"与"我的请求有问题"分开；
+3. 决策日志写 `phase="jev"`、`status="upstream_unstable"`，并在 `error.message`
+   与 `retry_budget` 里写明熔断原因（累计次数 / 上限）；
+4. 结果 JSON 顶层带 `retry_budget: {limit, spent, tripped, reason}`。
 
 ## 故障诊断：`jev-cu doctor`
 
@@ -145,6 +167,16 @@ Jev 的单步推理请求是**无状态幂等**的，所以服务端抖动可以
 要求模型只回 `{"act":"1"}`），分类为
 `not_configured` / `ok` / `auth_failed`(401,403) / `service_unavailable`(429,5xx) /
 `unreachable` / `bad_response`。
+`bad_response` 还会给出 `reason`，把两种"回复不对"分开（处置完全不同）：
+
+| `reason` | 含义 | 提示方向 |
+|---|---|---|
+| `no_json` | 回来的压根不是 JSON | 端点/协议不匹配，核对 `LLM_BASE_URL` |
+| `missing_act` | 是 JSON，但缺 `act` 字段 | 提示词不匹配，或该模型不是决策模型 |
+
+探测**刻意保持单次尝试**（`max_retries=0`）：体检要如实反映"此刻通不通"，
+重试会把一次瞬时故障掩盖成"正常"，也会让 doctor 变慢；有界重试只属于真实调用链。
+
 注意：**LLM 是可选兜底，它的状态只作诊断提示，不改变 doctor 的退出码**（退出码始终跟随权威的 Jev 探测）。
 
 ### 最常见的坑：`JEV_BASE_URL` 必须是 API 主机
@@ -164,7 +196,9 @@ Jev 的单步推理请求是**无状态幂等**的，所以服务端抖动可以
 | `JEV_API_KEY` | **必填**，Jev API key，只存在于工作区根 `.env` |
 | `JEV_BASE_URL` / `JEV_MODEL` | 默认 `https://api.typesafe.ai` / `jev-latest` |
 | `JEV_ROUTE_T` / `JEV_DONE_T` | 路由 / 完成阈值 |
-| `JEV_RETRY_MAX` | 瞬态错误最大重试次数，默认 `3` |
+| `JEV_RETRY_MAX` | Jev 单次调用最大重试次数，默认 `3` |
+| `JEV_RETRY_BUDGET` | session 级重试总预算，默认 `8` 次；触顶熔断为 `upstream_unstable` |
+| `LLM_RETRY_MAX` | LLM 单次调用最大重试次数，默认 `3`（与 Jev 同口径） |
 | `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | 系统二兜底；未配置则 `available() == False`，主循环如实记录「兜底不可用」并沿用 Jev 判断 |
 
 ## 协议级接入（不绑定任何宿主）
@@ -190,10 +224,13 @@ core/executor.py    Playwright 执行：按编号 click/fill/press_enter/dialog_
 core/loop.py        主循环 + DecisionLog（每步 flush + fsync）
 universal/cli.py    typer CLI（run / status / doctor）
 universal/mcp_server.py  FastMCP stdio server（browse / status）
-examples/           纯本地安全门演练：local_order_form.html + danger_gate_demo.py
+examples/           纯本地安全门演练：local_order_form.html + local_dialog_flow.html
+                    + danger_gate_demo.py（按钮型）+ danger_dialog_demo.py（弹窗内/连续危险动作）
+tests/              140 个 mock 用例（含真实浏览器用例，环境不可用时 skip）
 eval/               benchmark 脚本与两份实测报告
-docs/ARCHITECTURE.md 架构、状态机、决策日志格式
-.github/workflows/ci.yml  最小 CI（py3.9 + py3.11 跑 pytest）
+docs/ARCHITECTURE.md 架构、状态机、重试与熔断、诊断分类、决策日志格式
+CHANGELOG.md        版本变更与已知局限
+.github/workflows/ci.yml  最小 CI（py3.9 + py3.11 跑 pytest + compileall + 凭证自查）
 ```
 
 ## 测试
@@ -203,23 +240,35 @@ python3 -m pytest tests/ -q
 ```
 
 63 个用例，全部 mock，**不访问真实 API**；真实浏览器用例在环境不可用时 `pytest.skip`，保证离线也全绿。
+（当前实测 140 passed / 0 skipped，明细见 `CHANGELOG.md`。）
 
 ### 危险动作安全门演练（纯本地，不碰真实站点）
 
-`examples/local_order_form.html` 是一张本地表单，点击「提交订单」只在页面内改状态文本，
-不发任何网络请求、不跳转。演示脚本对同一张表单跑两遍完整主循环（真实 chromium）：
+两个演示脚本都用本地 HTML，页面内副作用只改文本/class，**不发网络请求、不跳转**：
 
 ```bash
-python3 examples/danger_gate_demo.py              # 脚本化决策，离线、确定性
+python3 examples/danger_gate_demo.py              # 按钮型：拒绝 vs 批准（8 项断言）
 python3 examples/danger_gate_demo.py --real-jev   # 用真实 Jev API 判断（需 JEV_API_KEY）
+python3 examples/danger_dialog_demo.py            # 弹窗内 + 连续多个危险动作（19 项断言）
 ```
 
-实测结果（8 项断言全过）：
+**按钮型**（`examples/local_order_form.html`，8/8 通过）：
 
 | 场景 | 人工答复 | 结果 | 页面状态 |
 |---|---|---|---|
 | A | 拒绝 `n` | `status=declined_dangerous_action`，危险词命中「提交」 | 仍是「尚未提交」，按钮仍可用 |
 | B | 批准 `y` | 动作真实执行 | 变为「已下单成功」，按钮被禁用 |
+
+**弹窗内 + 连续多个**（`examples/local_dialog_flow.html`，19/19 通过）：
+先点开对话框、在弹窗里填字，再操作弹窗内的「发送留言」，紧接着「删除草稿」——
+
+| 场景 | 人工答复 | 已执行的危险动作 | 被拦下的 | 页面终态 |
+|---|---|---|---|---|
+| A 全拒绝 | 拒绝 | 无 | 「发送」 | 弹窗仍打开、留言未发出、**已填的字仍在**（`message=你好`） |
+| B 连续全批准 | 批准两次 | 「发送」→「删除」 | 无 | `草稿已删除`，且**逐个动作各问一次人工**（2 次） |
+| C 只批准第一个 | 第二次拒绝 | 「发送」 | 「删除」 | `留言已发送`，但草稿**完好未删** |
+
+C 是"逐个过门"的关键证据：安全门是**每个动作各自**过门，不是一次批准就永久放行。
 
 ## 边界与安全
 

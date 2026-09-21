@@ -81,9 +81,11 @@ LLM 的单值 `confidence` 会被折成两候选分布后复用 Jev 的 margin �
 ## 主循环状态机
 
 ```
-init → (goto url) → 循环 {
+init → (goto URL) → 循环 {
     采集 → 无元素 → no_elements
-    Jev 调用异常 → error(jev_call_failed)
+    Jev 调用异常：
+        重试预算熔断 → upstream_unstable（写 phase="jev" + status + 熔断原因）
+        其他         → error(jev_call_failed)
     done >= 0.50（当前状态已判完成）→ 写 phase="done" 记录 → finished  ← 判定在动作之前
     决策不指向任何存在编号 → no_action
     危险动作且未确认 → declined_dangerous_action
@@ -173,7 +175,29 @@ brain_jev.ask()
 - 成功：`Decision.retries` 记录实际重试次数（随决策日志 `decision.retries` 落盘）。
 - 失败：抛 `JevError(message, retries, status)`；主循环把 `retries` / `status` 写进
   `phase="jev"` 记录的 `error` 字段，日志里能区分"服务端 5xx"与"请求本身有问题"。
-- 注入点：`ask(sender=..., sleep=..., max_retries=...)`，测试全 mock、不等待真实时间。
+- 注入点：`ask(sender=..., sleep=..., max_retries=..., budget=...)`，测试全 mock、不等待真实时间。
+
+### 两条链路共用同一套口径
+
+`brain_llm` **直接 import** `brain_jev` 的 `is_retryable_status` / `backoff_seconds` /
+`RETRY_SCHEDULE` / `RETRY_JITTER`（同一个函数对象、同一张退避表），单次上限各自用
+`JEV_RETRY_MAX` / `LLM_RETRY_MAX`（默认都是 3）。测试里有专门的"口径一致性"断言
+（`brain_llm.is_retryable_status is brain_jev.is_retryable_status`），防止两边漂移。
+
+### session 级总预算与熔断
+
+单次上限拦不住 503 风暴（每步各退避重试 ≈ 6s，25 步最坏多等 150s 仍在失败）。
+`RetryBudget` 跨步共享、累计计数：
+
+```
+每次"真的要重试一次"→ budget.spend()
+重试前 → budget.allow()  失败即抛 budget_exceeded=True 的错误
+进入 ask() 前 → budget.tripped 为真则**直接失败，不发请求**（硬闸门）
+```
+
+触顶（`JEV_RETRY_BUDGET`，默认 8）后主循环给 `status="upstream_unstable"`，
+决策日志的 `phase="jev"` 记录带 `status` 与 `retry_budget`，结果 JSON 顶层也带
+`retry_budget: {limit, spent, tripped, reason}`——"上游不稳定"与"我的请求有问题"因此可区分。
 
 ## 诊断分类（`jev-cu doctor`）
 
@@ -190,6 +214,11 @@ brain_jev.ask()
 | `network_unreachable` | 6 | `URLError` |
 
 LLM 探测复用 `brain_llm.http_transport`（注入点 `transport`），要求模型只回 `{"act":"1"}`，
-分类 `not_configured` / `ok` / `auth_failed` / `service_unavailable` / `unreachable` / `bad_response`。
+分类 `not_configured` / `ok` / `auth_failed` / `service_unavailable` / `unreachable` / `bad_response`；
+`bad_response` 再用 `reason` 区分 `no_json`（压根不是 JSON → 端点/协议不对）与
+`missing_act`（是 JSON 但缺 `act` → 提示词不匹配或不是决策模型），两者 hint 不同。
+
+探测**刻意单次尝试**（`max_retries=0`）：体检要如实反映"此刻通不通"，重试会把瞬时故障
+掩盖成正常；有界重试只属于真实调用链。
 **LLM 是可选兜底，其状态不改变 doctor 退出码**——退出码始终跟随权威的 Jev 探测结果。
 `http_transport` 把 `HTTPError` 统一换成带 `status` 的 `LlmError`，这是 LLM 分类能区分鉴权/5xx 的前提。
