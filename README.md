@@ -189,6 +189,63 @@ Jev 的单步推理请求是**无状态幂等**的，所以服务端抖动可以
 注意 `brain_jev` 的默认值本来就是正确的 API 主机，
 只有显式设置了错误的 `JEV_BASE_URL` 才会走偏——所以要么改对，要么删掉这一行。
 
+## 首次配置（快速开始）
+
+**本仓库不含任何 API key**；key 只存在于你自己的 `.env` 里，`请勿提交 .env`（已在 `.gitignore` 中）。
+
+```bash
+# 1) 生成配置文件（.env.example 里全是空占位，没有任何真实值）
+cp .env.example .env
+
+# 2) 由你自己填入 JEV_API_KEY
+#    申请地址：https://console.typesafe.ai
+#    编辑 .env，把 JEV_API_KEY= 后面填上你自己的 key
+#    （留空时 CLI 会报 missing_api_key，doctor 也会判 missing_key）
+
+# 3) 自查：确认端点、鉴权、网络都对
+jev-cu doctor          # 正常 → exit 0，并列出可用 models
+
+# 4) 跑第一条任务（推荐：单目标任务，实测 2 步即达 finished）
+jev-cu run '在维基百科搜索"人工智能"' --url https://www.wikipedia.org --max-steps 6
+
+# 只想验证链路通不通，也可以用 example.com 这类占位页：
+# 它会真的打开并点进链接，但页面本身没有"任务已完成"的语义，通常停在 max_steps（属正常）
+jev-cu run "打开 example.com 并读取页面标题" --url https://example.com --max-steps 5
+```
+
+`doctor` 的退出码就是"哪一类故障"的答案（详见「故障诊断」节）：
+`0` 正常 · `2` 缺 key · `3` base_url 指错（指到网页控制台） · `4` 鉴权失败(401/403) ·
+`5` 服务不可用(5xx) · `6` 网络不可达。
+
+### `.env` 从哪读（优先级与安全）
+
+- **优先级**：显式指定 > **仓库根 `.env`** > 当前工作目录（及其上溯）。
+  仓库根优先，避免你在别处执行命令时误加载无关目录的 `.env`。
+- **不会加载 `~/.env`**：上溯在用户主目录处停止，主目录里的同名变量不会被静默带进来。
+- **只记路径、不记值**：`doctor` 输出的 `env_file` 字段与调试日志只写**路径字符串**；
+  设 `JEV_DEBUG=1` 可看到实际加载了哪个 `.env`（依然只有路径，没有任何值）。
+- 已是环境变量的同名项**不会被 `.env` 覆盖**（`setdefault` 语义）。
+
+### LLM 兜底是**可选**的
+
+`LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` 三个变量**都可以不填**：
+不填时低 margin 的步骤**沿用 Jev 的判断**，决策日志如实记 `not_configured`，
+`doctor` 也会提示 `not_configured`（不影响退出码）。
+
+要启用兜底就填上，注意 **base_url 必须自带版本段**（如 `/v1`，不要只写域名根）：
+
+```bash
+# OpenAI 官方
+LLM_BASE_URL=https://api.openai.com/v1
+LLM_API_KEY=<你自己的 key>
+LLM_MODEL=gpt-4o-mini
+
+# 自建/第三方 OpenAI 兼容网关
+LLM_BASE_URL=https://your-gateway.example.com/v1
+LLM_API_KEY=<你自己的 key>
+LLM_MODEL=<该网关支持的模型名>
+```
+
 ## 配置项（环境变量，见 `.env.example`）
 
 | 变量 | 说明 |

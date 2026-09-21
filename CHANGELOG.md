@@ -37,7 +37,14 @@
   只使用 `examples/` 下的本地 HTML，不发网络请求、不跳转。
 - **测试**：140 个用例全 mock、离线可跑；真实浏览器用例在环境不可用时 `pytest.skip`。
 - **CI**：`.github/workflows/ci.yml`（Python 3.9 + 3.11 跑 pytest / compileall / 凭证自查）。
-- **文档**：`README.md`、`docs/ARCHITECTURE.md`、`eval/` 下两份实测报告。
+- **文档**：`README.md`（含「首次配置（快速开始）」：`cp .env.example .env` → 自行填 key →
+  `jev-cu doctor` 自查 → 第一条任务；并说明 LLM_* 为可选及其 base_url 版本段要求）、
+  `docs/ARCHITECTURE.md`、`eval/` 下两份实测报告。
+- **`.env` 加载策略**：优先级为「显式指定 > 仓库根 > cwd 及其上溯」，上溯在用户主目录处停止
+  （不加载 `~/.env`）；已是环境变量的同名项不会被覆盖（`setdefault`）。
+  `doctor` 输出 `env_file` 字段、`JEV_DEBUG=1` 时的调试日志，都**只记录路径字符串，绝不记录任何值**。
+- **面向使用者的 `.env.example` 注释**：JEV_API_KEY 申请地址与留空后果、LLM_* 可选的后果、
+  `JEV_BASE_URL` 必须是 API 主机的警告。
 
 ### 实测数据（真实站点 · 真实 API）
 

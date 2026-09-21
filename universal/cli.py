@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -24,6 +25,12 @@ from core import brain_jev, brain_llm
 from core import loop as loop_mod
 
 SCHEMA_VERSION = "1"
+
+# 仓库根（本文件在 <root>/universal/cli.py）：.env 的第一优先候选位置。
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# 上溯查找 .env 的上界：不加载 HOME_DIR 及其以上的 .env（与本项目无关）。
+HOME_DIR = os.path.expanduser("~")
+ENV_FILENAME = ".env"
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_CONFIG = 2          # 缺少 JEV_API_KEY
@@ -49,29 +56,82 @@ app = typer.Typer(add_completion=False,
                   help="Jev-driven 浏览器 computer-use：Jev 做系统一判断，LLM 只在低 margin 时兜底")
 
 
-def load_env(start=None):
-    """从 start 逐级向上寻找 .env，只 setdefault，绝不回显任何值。"""
-    here = os.path.abspath(start or os.getcwd())
+def debug_enabled():
+    return (os.environ.get("JEV_DEBUG") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def debug_log(message):
+    """调试日志只允许写**路径、环境变量名**这类非敏感信息，绝不允许写任何值。"""
+    if debug_enabled():
+        sys.stderr.write("[jev-cu] %s\n" % message)
+        sys.stderr.flush()
+
+
+def _walk_up(start_dir):
+    """从 start_dir 逐级上溯产出目录；在 HOME_DIR 处停止。
+
+    用户主目录（乃至更上层）的 .env 与本项目无关，**不自动加载**——
+    否则 ~/.env 里恰好有同名变量时会被静默带进来。
+    """
+    here = os.path.abspath(start_dir)
+    home = os.path.abspath(HOME_DIR)
     while True:
-        candidate = os.path.join(here, ".env")
-        if os.path.isfile(candidate):
-            try:
-                with open(candidate, "r", encoding="utf-8") as fh:
-                    for line in fh:
-                        line = line.strip()
-                        if not line or line.startswith("#") or "=" not in line:
-                            continue
-                        key, _, value = line.partition("=")
-                        key = key.strip()
-                        if key:
-                            os.environ.setdefault(key, value.strip().strip('"').strip("'"))
-            except OSError:
-                return None
-            return candidate
+        yield here
         parent = os.path.dirname(here)
-        if parent == here:
-            return None
+        if parent == here or here == home or parent == home:
+            break
         here = parent
+
+
+def find_env_file(start=None):
+    """定位要加载的 .env，返回**路径字符串**或 None（只返回路径，绝不返回值）。
+
+    优先级：显式 `start`（及其上溯，止于 HOME_DIR）> **仓库根** > 当前工作目录（及其上溯）。
+    仓库根优先于 cwd 上溯，是为了避免"随手在别处跑一下"时误加载无关目录的 .env。
+    """
+    ordered = []
+    if start:
+        ordered.extend(_walk_up(start))
+    ordered.append(PROJECT_ROOT)
+    ordered.extend(_walk_up(os.getcwd()))
+
+    seen = set()
+    for directory in ordered:
+        directory = os.path.abspath(directory)
+        if directory in seen:
+            continue
+        seen.add(directory)
+        candidate = os.path.join(directory, ENV_FILENAME)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def load_env(start=None):
+    """加载 .env（优先级见 `find_env_file`）。只 setdefault，绝不回显任何值。
+
+    返回**实际加载的路径**（仅路径，供 doctor 输出与调试日志使用）。
+    """
+    path = find_env_file(start=start)
+    if not path:
+        debug_log("未找到 .env（候选含仓库根 %s 与 cwd 上溯，止于 HOME_DIR）："
+                  "凭证需来自环境变量" % PROJECT_ROOT)
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                if key:
+                    os.environ.setdefault(key, value.strip().strip('"').strip("'"))
+    except OSError as exc:
+        debug_log("读取 .env 失败（路径 %s）：%s" % (path, exc))
+        return None
+    debug_log("已加载 .env：%s（仅记录路径，不记录任何值）" % path)
+    return path
 
 
 def emit(payload, code=EXIT_OK):
@@ -274,9 +334,12 @@ def doctor(
     env_file = load_env()
     key = os.environ.get("JEV_API_KEY") or ""
     base = (base_url or os.environ.get("JEV_BASE_URL") or api_host).rstrip("/")
+    debug_log("doctor 探测 base_url=%s（不含任何凭证）" % base)
 
     report = {
         "schema_version": SCHEMA_VERSION,
+        # 只记**路径**：告诉使用者"到底读了哪个 .env"，绝不回显任何值
+        "env_file": env_file,
         "env_file_found": bool(env_file),
         "jev_api_key": "present" if key else "missing",
         "jev_base_url": base,
