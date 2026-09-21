@@ -94,16 +94,27 @@ def has_input(elements):
 
 
 def plan_intent(decision, element, elements=None, values=None, task="",
-                enable_dialog_search=True):
+                values_provided=False, enable_dialog_search=True):
     """把决策落成具体动作意图。
+
+    填字文本来源优先级：`--value` 队列（按顺序消费）> 任务文本里的引号 / 「搜索 X」句式
+    > 无（该输入框按 click 处理）。
 
     输入框 → fill（先点后填，可选回车）；页面上没有任何输入框但任务带待输入文本
     → dialog_search（点触发按钮后出现的输入框，对应 benchmark 里 GitHub 模式）；
     其余 → click。
+
+    注意 values_provided：显式给了 `--value` 队列但已用尽时**不再回落到猜文本**，
+    否则第一个值会被重复灌进后面每一个输入框（多字段表单会全填成同一个值）。
     """
     idx = str(decision.act)
     pending = list(values or [])
-    value = pending[0] if pending else extract_value(task)
+    if pending:
+        value = pending[0]
+    elif values_provided:
+        value = ""
+    else:
+        value = extract_value(task)
 
     if element and element.get("is_input"):
         if value:
@@ -157,6 +168,8 @@ def run(task, url=None, max_steps=25, headless=True, log_dir=".", session_id=Non
 
         result["status"] = "max_steps"
         consecutive_errors = 0
+        pending_values = list(values or [])
+        value_cursor = 0        # --value 按"第几次填字"顺序消费
         for step in range(1, max_steps + 1):
             elements = sensor.collect(page, limit=collect_limit)
             if not elements:
@@ -192,6 +205,21 @@ def run(task, url=None, max_steps=25, headless=True, log_dir=".", session_id=Non
                     fallback = {"used": False, "reason": "not_configured",
                                 "missing": brain_llm.missing_env()}
 
+            # 完成判定发生在动作**之前**：Jev 的问题是"结合历史，任务是否已经完成"，
+            # 问的是**当前**状态。当前状态已判完成就必须立即终止，绝不能再执行一个动作，
+            # 否则会把页面推离目标态（T7 实测：搜索结果页上又点了一次空搜索，
+            # final URL 变成空查询，done 却仍有 0.64 —— status=finished 与页面实际状态对不上）。
+            if used.finished:
+                log.append({"ts": time.time(), "session_id": session_id, "step": step,
+                            "phase": "done", "status": "finished",
+                            "decision": used.as_dict(), "fallback": fallback,
+                            "elements_count": len(elements),
+                            "snapshot": execu.snapshot()})
+                result["status"] = "finished"
+                result["steps"] = step - 1          # 本步没有执行动作
+                result["decided_finished_at_step"] = step
+                break
+
             chosen = next((e for e in elements if str(e["idx"]) == str(used.act)), None)
             label = ("<%s> %s" % (chosen["tag"], chosen["label"])) if chosen else str(used.act)
             guard = safety.describe(label)
@@ -219,7 +247,10 @@ def run(task, url=None, max_steps=25, headless=True, log_dir=".", session_id=Non
                                    "message": "决策未指向任何存在的元素编号：%r" % used.act}
                 break
 
-            intent = plan_intent(used, chosen, elements, values, task)
+            intent = plan_intent(used, chosen, elements, pending_values[value_cursor:], task,
+                                 values_provided=bool(pending_values))
+            if intent["kind"] in ("fill", "dialog_search") and intent.get("value"):
+                value_cursor += 1        # 一个值只喂一个输入框
             execution = execu.execute(intent["kind"], intent["idx"],
                                       value=intent.get("value"), label=label,
                                       submit=intent.get("submit", True))
@@ -241,8 +272,14 @@ def run(task, url=None, max_steps=25, headless=True, log_dir=".", session_id=Non
                     pass
 
             result["steps"] = step
-            history.append("step%d: %s %s -> %s" % (step, intent["kind"], label,
-                                                    "ok" if execution["ok"] else "fail"))
+            # 历史必须带上"键入了什么、结果落在哪个 URL"——只写 "fill -> ok" 时，
+            # Jev 不知道搜索已经做过，会反复重填同一个搜索框（T7 实测的震荡根因）。
+            history.append("step%d: %s %s%s → %s | url=%s" % (
+                step, intent["kind"], label,
+                ("，键入[%s]" % intent["value"]) if intent.get("value") else "",
+                "成功" if execution["ok"] else "失败:%s" % (
+                    (execution.get("error") or {}).get("type")),
+                (execution.get("url") or "")[:70]))
 
             if not execution["ok"]:
                 consecutive_errors += 1
@@ -252,10 +289,8 @@ def run(task, url=None, max_steps=25, headless=True, log_dir=".", session_id=Non
                     break
                 continue
             consecutive_errors = 0
-
-            if used.finished:
-                result["status"] = "finished"
-                break
+            # 注意：完成判定已在动作之前做过（见上面 used.finished 分支），
+            # 这里不再重复判断——判完成时本步动作根本不会执行。
 
         snap = execu.snapshot()
         result["final"] = snap
@@ -309,8 +344,12 @@ def summarize_log(session_id, log_dir="."):
     summary["status"] = ends[-1].get("status") if ends else "no_terminal_record"
     summary["steps"] = len(acts)
     summary["parse_errors"] = sum(1 for r in records if "_parse_error" in r)
+    # finished 的权威来源是"判定完成"的那条记录，它可能是 phase="done"
+    # （判定在动作之前 → 该步没有 act 记录），只看 act 会漏掉。
+    summary["finished"] = any(
+        (r.get("decision") or {}).get("finished")
+        for r in records if r.get("phase") in ("act", "done"))
     if last:
-        summary["finished"] = bool((last.get("decision") or {}).get("finished"))
         summary["last_step"] = {
             "step": last.get("step"),
             "intent": last.get("intent"),

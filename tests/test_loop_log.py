@@ -186,9 +186,13 @@ def test_executor_success_shape_and_fill_clicks_first():
 def test_loop_runs_one_step_and_logs_each_step(tmp_path):
     elements = [{"idx": 1, "tag": "button", "label": "Search", "is_input": False}]
     page = FakePage(elements=elements)
+    calls = {"n": 0}
 
     def fake_jev(task, els, history=None, **kw):
-        return fixed_decision(act="1", done=0.6, finished=True)
+        calls["n"] += 1
+        # 第 1 步未完成 → 执行动作；第 2 步判完成 → 立即终止（不再动作）
+        done = 0.64 if calls["n"] >= 2 else 0.05
+        return fixed_decision(act="1", done=done, finished=done >= 0.5)
 
     result = loop.run(task="搜索", url="https://fake.test/", page=page, max_steps=3,
                       log_dir=str(tmp_path), session_id="sess-a", jev_ask=fake_jev)
@@ -198,14 +202,36 @@ def test_loop_runs_one_step_and_logs_each_step(tmp_path):
     assert result["steps"] == 1
 
     records = loop.read_log(result["log_path"])
-    assert [r["phase"] for r in records] == ["act", "end"]
+    assert [r["phase"] for r in records] == ["act", "done", "end"]
     assert records[0]["decision"]["act"] == "1"
     assert records[0]["execution"]["ok"] is True
     assert records[0]["elements_count"] == 1
+    assert records[1]["status"] == "finished"
+    assert records[1]["decision"]["done"] == 0.64
 
     summary = loop.summarize_log("sess-a", log_dir=str(tmp_path))
     assert summary["status"] == "finished"
     assert summary["steps"] == 1
+
+
+def test_loop_stops_before_acting_when_already_finished(tmp_path):
+    """当前状态已判完成时，必须先终止，不能再执行动作（T7 实测的错序 bug）。"""
+    elements = [{"idx": 1, "tag": "button", "label": "Search", "is_input": False}]
+    page = FakePage(elements=elements)
+
+    def already_done_jev(task, els, history=None, **kw):
+        return fixed_decision(act="1", done=0.64, finished=True)
+
+    result = loop.run(task="搜索", page=page, max_steps=5, log_dir=str(tmp_path),
+                      session_id="sess-early", jev_ask=already_done_jev)
+
+    assert result["status"] == "finished"
+    assert result["steps"] == 0
+    assert result["decided_finished_at_step"] == 1
+    assert page.waits == [], "判完成时不得执行动作，连等待都不该有"
+
+    records = loop.read_log(result["log_path"])
+    assert [r["phase"] for r in records] == ["done", "end"]
 
 
 def test_loop_stops_when_human_declines_dangerous_action(tmp_path):
@@ -268,3 +294,102 @@ def test_loop_returns_structured_error_when_jev_call_fails(tmp_path):
     assert result["status"] == "error"
     assert result["error"]["type"] == "jev_call_failed"
     assert "JEV_API_KEY" in result["error"]["message"]
+
+
+# ---------------------------------------------------------------- --value 顺序消费（多字段表单回归）
+def scripted_jev(picks, finish_on_last=False):
+    """按顺序返回指定编号的决策：离线、确定性，用来测主循环而不是测 Jev。
+
+    finish_on_last=False 时永不判完成，主循环跑到 max_steps 为止（便于断言"恰好执行了 N 个动作"）。
+    """
+    state = {"i": 0}
+
+    def _ask(task, els, history=None, **kw):
+        pick = picks[min(state["i"], len(picks) - 1)]
+        state["i"] += 1
+        done = 0.9 if (finish_on_last and state["i"] >= len(picks)) else 0.05
+        decision = fixed_decision(act=str(pick), done=done, source="scripted")
+        decision.finished = done >= 0.5
+        return decision
+
+    return _ask
+
+
+def test_values_are_consumed_in_order_one_per_input(tmp_path):
+    """--value 队列按顺序消费，一个值只喂一个输入框（否则多字段会全填同一个值）。"""
+    elements = [
+        {"idx": 1, "tag": "input", "label": "姓名", "is_input": True},
+        {"idx": 2, "tag": "input", "label": "电话", "is_input": True},
+        {"idx": 3, "tag": "input", "label": "地址", "is_input": True},
+    ]
+    fills = []
+
+    class RecordingElement(FakeElement):
+        def fill(self, value, timeout=None):
+            fills.append(value)
+
+    page = FakePage(element=RecordingElement(), elements=elements)
+    result = loop.run(task="填写收货信息", page=page, max_steps=3, log_dir=str(tmp_path),
+                      session_id="sess-values", values=["张三", "13800000000"],
+                      jev_ask=scripted_jev([1, 2, 3]))
+
+    assert fills == ["张三", "13800000000"]
+    records = [r for r in loop.read_log(result["log_path"]) if r.get("phase") == "act"]
+    assert [r["intent"]["kind"] for r in records] == ["fill", "fill", "click"]
+    assert records[0]["intent"]["value"] == "张三"
+    assert records[1]["intent"]["value"] == "13800000000"
+    assert records[2]["intent"]["value"] is None      # 队列用尽后不再猜文本
+
+
+def test_extract_value_fallback_used_only_when_no_values_given(tmp_path):
+    """没给 --value 时才回落到任务文本抽取。"""
+    elements = [{"idx": 1, "tag": "input", "label": "搜索", "is_input": True}]
+    fills = []
+
+    class RecordingElement(FakeElement):
+        def fill(self, value, timeout=None):
+            fills.append(value)
+
+    page = FakePage(element=RecordingElement(), elements=elements)
+    loop.run(task='搜索"人工智能"', page=page, max_steps=1, log_dir=str(tmp_path),
+             session_id="sess-extract", jev_ask=scripted_jev([1]))
+
+    assert fills == ["人工智能"]
+
+
+def test_executor_classifies_detached_element_after_fill():
+    """fill 成功后元素脱离 DOM：必须报独立类型，且不得按编号重按回车（会被误操作）。"""
+    class Detaching(FakeElement):
+        def press(self, key, timeout=None):
+            raise RuntimeError("ElementHandle.press: Element is not attached to the DOM")
+
+    result = Executor(FakePage(element=Detaching())).execute("fill", "5", value="x")
+    assert result["ok"] is False
+    assert result["error"]["type"] == "element_detached_after_action"
+    assert "已填入" in result["error"]["message"]
+
+
+def test_summarize_log_sees_finished_from_done_phase(tmp_path):
+    """判定在动作之前：终态可能没有 act 记录，finished 必须仍能从 phase="done" 读出。"""
+    log = loop.DecisionLog("sess-done-phase", base_dir=str(tmp_path))
+    log.append({"step": 1, "phase": "act", "intent": {"kind": "fill", "idx": "1"},
+                "decision": {"finished": False}, "execution": {"ok": True, "url": "u1"}})
+    log.append({"step": 2, "phase": "done", "status": "finished",
+                "decision": {"finished": True, "done": 0.63}})
+    log.append({"phase": "end", "status": "finished", "steps": 1})
+
+    summary = loop.summarize_log("sess-done-phase", log_dir=str(tmp_path))
+    assert summary["status"] == "finished"
+    assert summary["steps"] == 1
+    assert summary["finished"] is True
+
+
+def test_summarize_log_not_finished_when_no_decision_claims_it(tmp_path):
+    log = loop.DecisionLog("sess-unfinished", base_dir=str(tmp_path))
+    log.append({"step": 1, "phase": "act", "intent": {"kind": "click", "idx": "1"},
+                "decision": {"finished": False}, "execution": {"ok": True, "url": "u"}})
+    log.append({"phase": "end", "status": "max_steps", "steps": 1})
+
+    summary = loop.summarize_log("sess-unfinished", log_dir=str(tmp_path))
+    assert summary["status"] == "max_steps"
+    assert summary["finished"] is False

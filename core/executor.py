@@ -152,7 +152,19 @@ class Executor:
             el.fill(str(value), timeout=self.timeout_ms)
             waited = self._wait(self.wait_ms)
             if submit:
-                el.press("Enter", timeout=self.timeout_ms)
+                try:
+                    el.press("Enter", timeout=self.timeout_ms)
+                except Exception as exc:
+                    # 填充成功后元素因页面跳转脱离 DOM。**绝不能**按编号重新按一次回车：
+                    # 编号是新页面重新分配的，会指向另一个元素 —— 那是误操作。
+                    # 如实上报为独立错误类型，让主循环下一步重新采集。
+                    if "not attached" in str(exc):
+                        return self._error(
+                            "fill", idx, "element_detached_after_action",
+                            "文本已填入，但回车提交时元素已脱离 DOM（页面已跳转）：%s"
+                            % str(exc)[:160], started, label=label, value=str(value),
+                            waited=waited)
+                    raise
                 waited += self._wait_nav()
             return self._ok("fill", idx, label=label, value=str(value),
                             waited=waited, started=started)

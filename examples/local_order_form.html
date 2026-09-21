@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>本地订单表单（安全门演练用，纯离线）</title>
+</head>
+<body>
+  <h1>本地订单表单</h1>
+  <p id="status">尚未提交</p>
+
+  <form id="order" onsubmit="return false">
+    <p><label>姓名 <input id="customer" name="customer" type="text" placeholder="姓名"></label></p>
+    <p><label>电话 <input id="phone" name="phone" type="text" placeholder="电话"></label></p>
+    <p><button id="submit-order" type="button">提交订单</button></p>
+  </form>
+
+  <script>
+    // 纯本地副作用：点击后改状态文本并禁用按钮，不做任何网络请求、不跳转。
+    document.getElementById('submit-order').addEventListener('click', function () {
+      document.getElementById('status').textContent = '已下单成功';
+      this.disabled = true;
+    });
+  </script>
+</body>
+</html>

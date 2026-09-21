@@ -65,6 +65,33 @@ jev-cu status 20260921-120000-ab12cd
 jev-cu doctor
 ```
 
+### 要填进输入框的文本从哪来（`--value` 优先）
+
+按优先级依次尝试，**第一优先是 `--value`，复杂任务请一律用它**：
+
+| 优先级 | 来源 | 例子 |
+|---|---|---|
+| 1 | `--value`（可重复，按顺序消费） | `--value admin --value 's3cret'` |
+| 2 | 任务文本里的引号内容 | `"在维基百科搜索\"人工智能\""` → `人工智能` |
+| 3 | 任务文本里的「搜索 X」句式 | `"百度搜索 TypeSafe AI 并执行"` → `TypeSafe AI` |
+| 4 | 都没有 → 该输入框按 click 处理（不填字） |
+
+`--value` 是**位置无关的顺序队列**：第 1 个 `--value` 给第一个被选中的输入框，
+第 2 个给第二个，以此类推。多字段表单（登录、收货地址、多步向导）必须逐个显式给出：
+
+```bash
+# 登录：用户名 + 密码，两个 --value 按被选中顺序消费
+jev-cu run "登录后台并确认进入仪表盘" --url https://example.com/login \
+         --value admin --value 's3cret'
+
+# 收货表单：姓名 / 电话 / 地址
+jev-cu run "填写收货信息" --url file:///tmp/order.html \
+         --value 张三 --value 13800000000 --value "北京市海淀区"
+```
+
+注意 `--value` 只负责**文本**；「要不要回车提交」由元素类型决定
+（输入框默认 fill 后回车）。危险动作另走安全门，见下节。
+
 输出永远是 JSON，且必带 `schema_version: "1"`：
 
 ```json
@@ -127,10 +154,12 @@ core/brain_llm.py   系统二兜底：OpenAI 兼容，传输层可注入
 core/safety.py      危险动作识别（中英）+ 人工确认门（reader 可注入）
 core/executor.py    Playwright 执行：按编号 click/fill/press_enter/dialog_search，异常转结构化错误
 core/loop.py        主循环 + DecisionLog（每步 flush + fsync）
-universal/cli.py    typer CLI
-universal/mcp_server.py  FastMCP stdio server
+universal/cli.py    typer CLI（run / status / doctor）
+universal/mcp_server.py  FastMCP stdio server（browse / status）
+examples/           纯本地安全门演练：local_order_form.html + danger_gate_demo.py
 eval/               benchmark 脚本与两份实测报告
-docs/ARCHITECTURE.md 架构与决策日志格式
+docs/ARCHITECTURE.md 架构、状态机、决策日志格式
+.github/workflows/ci.yml  最小 CI（py3.9 + py3.11 跑 pytest）
 ```
 
 ## 测试
@@ -139,7 +168,24 @@ docs/ARCHITECTURE.md 架构与决策日志格式
 python3 -m pytest tests/ -q
 ```
 
-46 个用例，全部 mock，**不访问真实 API**；真实浏览器用例在环境不可用时 `pytest.skip`，保证离线也全绿。
+63 个用例，全部 mock，**不访问真实 API**；真实浏览器用例在环境不可用时 `pytest.skip`，保证离线也全绿。
+
+### 危险动作安全门演练（纯本地，不碰真实站点）
+
+`examples/local_order_form.html` 是一张本地表单，点击「提交订单」只在页面内改状态文本，
+不发任何网络请求、不跳转。演示脚本对同一张表单跑两遍完整主循环（真实 chromium）：
+
+```bash
+python3 examples/danger_gate_demo.py              # 脚本化决策，离线、确定性
+python3 examples/danger_gate_demo.py --real-jev   # 用真实 Jev API 判断（需 JEV_API_KEY）
+```
+
+实测结果（8 项断言全过）：
+
+| 场景 | 人工答复 | 结果 | 页面状态 |
+|---|---|---|---|
+| A | 拒绝 `n` | `status=declined_dangerous_action`，危险词命中「提交」 | 仍是「尚未提交」，按钮仍可用 |
+| B | 批准 `y` | 动作真实执行 | 变为「已下单成功」，按钮被禁用 |
 
 ## 边界与安全
 
@@ -147,12 +193,20 @@ python3 -m pytest tests/ -q
 - 危险动作（提交/支付/删除/发送/转账…）无条件人工确认；确认失败、空输入、异常一律视为拒绝。
 - 不绕过验证码、不规避站点反爬；请遵守目标站点条款。
 - 日志不记录任何凭证；`.env` 只在 `.gitignore` / `.env.example` 层面出现。
+- 完成判定发生在动作**之前**：`done >= 0.50` 时不再执行任何动作。
+  但 `status=finished` 只代表「Jev 判定完成」，关键结论请以 `final.url` / `final.title` 为准。
 
 ## 已知局限（如实）
 
 - 样本量仍偏小（8 步 / 15 步），阈值置信区间宽，需多站点复测。
 - 未覆盖：验证码、iframe、Canvas 应用、候选元素超过 30 个的长列表页面。
 - 输入文本抽取依赖任务文本里的引号或「搜索 X」句式，复杂场景请用 `--value` 显式给出。
+- **多目标任务会震荡**（T7 实测）：任务「搜索 X **并打开词条**」在 12 步内
+  `done` 始终 ≤ 0.18，循环反复重填同一个搜索框、重复点「Search」按钮，
+  始终不去点结果链接。拆成两个单目标任务（先搜索、再打开）即可正常终止：
+  单目标任务「搜索 X」在第 2 步 `done=0.63 ≥ 0.50` 正常 `finished`。
+  根因：候选元素被截断在 30 个（结果页链接被挤掉）+ 历史信息不足以表达"搜索已完成、该点结果了"。
+  改进方向：分阶段子目标，或按任务显式指定"打开第 N 个结果"。
 
 ## License
 
