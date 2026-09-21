@@ -1,0 +1,26 @@
+# 凭证：绝不提交（真实 key 只存在于工作区根 .env）
+.env
+*.env.local
+.env.local
+
+# 运行时产物：决策日志 / 运行目录
+.jev-cu/
+runs/
+
+# 窗口调用生成的工具残留（codexos 等），非交付物
+.codex-os/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# 测试缓存
+.pytest_cache/
+.coverage
+htmlcov/

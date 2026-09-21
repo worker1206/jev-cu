@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jev-cu"
+version = "0.1.0"
+description = "Jev-driven browser computer-use：Jev 做系统一判断，LLM 做系统二生成"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+dependencies = ["playwright>=1.40", "typer>=0.9"]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.0"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+jev-cu = "universal.cli:main"
+jev-cu-mcp = "universal.mcp_server:main"
+
+[tool.setuptools]
+packages = ["core", "universal"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

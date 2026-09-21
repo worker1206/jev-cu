@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: pytest (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 = 本项目声明的下限；3.11 = 推荐版本（mcp 需要 >=3.10）
+        python-version: ["3.9", "3.11"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: 安装必需依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest typer
+
+      - name: 安装可选依赖 mcp（Python < 3.10 装不上，不因此失败）
+        run: |
+          pip install mcp || echo "::notice::mcp 安装失败（可选依赖，Python < 3.10 属预期）：相关用例会自行 skip"
+
+      - name: 安装 playwright（可选；装不上则浏览器用例自行 skip）
+        continue-on-error: true
+        run: |
+          pip install playwright
+          python -m playwright install --with-deps chromium
+
+      - name: 运行测试
+        run: python -m pytest tests/ -q
+
+      - name: 语法自检
+        run: python -m compileall -q core universal tests
+
+      - name: 安全自查（不得出现真实凭证 / 不得提交 .env）
+        run: |
+          test ! -f .env || { echo "::error::.env 不应被提交"; exit 1; }
+          if grep -rInE "(sk-[A-Za-z0-9]{20,}|Bearer [A-Za-z0-9_.-]{30,})" core universal tests; then
+            echo "::error::发现疑似硬编码凭证"; exit 1
+          fi
+          echo "凭证自查通过"
