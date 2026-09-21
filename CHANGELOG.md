@@ -72,19 +72,50 @@
   `element_not_found`（连续 3 次 → `status="execution_failed"`）；
   只有 `act` 为空才是 `status="no_action"`。
 
+### Closed
+
+- **[T2] LLM 兜底端到端 —— 已闭环 ✅**（2026-09-21，真实 provider 验证）
+  **两段都保留**：wiring 段是补充说明，真实 provider 段才是闭环依据。
+
+  - **真实 provider 段（闭环证据）**：用户提供真实 key 后实测
+    （`LLM_BASE_URL=https://api.deepseek.com/v1`、`LLM_MODEL=deepseek-flash`）；
+    两段证据如下。
+    1. **强制升级**（`JEV_ROUTE_T=0.95`，真实 API + 真实浏览器）：
+       `status=finished`、`llm_fallback={"available": true, "used": 3, "missing": []}`，
+       每一步 `source="llm"` 且 `need_llm=False`（**未发生二次升级**）：
+```
+step | phase | source | act | conf | margin | done | need_llm | retries | intent / label
+   1 | act   | llm    | 11  | 0.95 | 0.90   | 0.00 | False    | 0       | fill <input> search      ok=True
+   2 | act   | llm    | 28  | 0.85 | 0.70   | 0.00 | False    | 0       | click <a> 人工智能        ok=True
+   3 | done  | llm    |     |      | 0.80   | 0.95 | False    | 0       | （判定完成，未执行动作）
+final.title = 人工智能 - Wikipedia
+```
+       LLM 接管的判断与 Jev 一致（都选同一个搜索框），并真实打开了词条。
+    2. **默认阈值不触发升级**（`JEV_ROUTE_T=0.30`，**LLM 成本为 0**）：
+       `status=finished`、`llm_fallback={"available": true, "used": 0, "missing": []}`，
+       `source="jev"`：
+```
+step | phase | source | act | conf | margin | done | need_llm | retries | intent / label
+   1 | act   | jev    | 11  | 0.85 | 0.80   | 0.07 | False    | 0       | fill <input> search      ok=True
+   2 | done  | jev    |     |      | 0.78   | 0.59 | False    | 0       | （判定完成，未执行动作）
+final.title = 人工智能 - Search results - Wikipedia
+```
+      结论与阈值校准一致：**Jev 有把握时不调用 LLM，只有 `margin < 0.30` 才升级**。
+    3. 验收窗口的独立验证同样成立（其 `step1` `source=llm`、`margin=0.96`、`used=2`）。
+    4. 旁证：`jev-cu doctor` 对真实 provider 的 LLM 探测判 `ok`
+       （`model=deepseek-flash`、`reply="1"`、`latency≈1.44s`）——即 T13 的探测链路也已在真实 provider 上验证。
+
+  - **wiring 段（补充说明，保留）**：`examples/llm_stub_demo.py` 起一个只监听 127.0.0.1 的
+    OpenAI 兼容 stub，在**没有任何 LLM key** 的情况下跑通**真实 HTTP 往返 + 真实 JSON 解析 +
+    真实重试 + 真实主循环 + 真实 chromium 执行 + 真实 fsync 决策日志**；断言
+    `decision.source=="llm"`、`llm_fallback.used>0`、升级后 `need_llm==False`、
+    stub 首次回 503 时 `Decision.retries==1`。见 `tests/test_llm_wiring.py`。
+    **它本身不等于 T2 闭环**，只是让"接线"可以在无凭证环境下被验证与回归。
+
 ### Known Limitations
 
 如实列出本版本**没有**解决的问题（不要当成已完成）：
 
-- **[T2] LLM 兜底：wiring 已验证，真实 provider 端到端待 key**（两段，别混为一谈）
-  - **wiring 已用本地 stub 验证 ✅**：`examples/llm_stub_demo.py` 起一个只监听 127.0.0.1 的
-    OpenAI 兼容 stub，跑通了**真实 HTTP 往返 + 真实 JSON 解析 + 真实重试 + 真实主循环 +
-    真实 chromium 执行 + 真实 fsync 决策日志**；断言成立：`decision.source=="llm"`、
-    `llm_fallback.used>0`、升级后 `need_llm==False`（不二次升级）、stub 首次回 503 时
-    `Decision.retries==1`。见 `tests/test_llm_wiring.py`。
-  - **真实 provider 端到端待 key ⏳**：本机未配置 `LLM_BASE_URL` / `LLM_API_KEY`，
-    **没有**用任何真实 provider 验证过"低 margin → LLM 接管"。
-    因此 T2 **尚未闭环**，stub 验证不能当作 T2 完成。
 - **[T3] MCP 真实握手未验证**：`mcp` 包要求 Python ≥ 3.10，本机 3.9 装不上。
   已验证的是"模块可 import、工具恒返回 JSON 字符串、缺包时清晰提示并退出码 2"，
   **FastMCP 的真实 stdio 握手未验证**。
@@ -100,8 +131,10 @@
 - **[T14 残余] 安全演练覆盖面**：已覆盖按钮型 + 弹窗内 + 连续多个危险动作；
   未覆盖 iframe 内、以及"批准后动作本身失败"的路径。
 - **[T13 残余]** doctor 的 LLM 探测为单次尝试（刻意如此），`bad_response` 只校验 `act` 字段存在性。
-- **[T19] stub ≠ provider**：stub 只覆盖"形状正确"的响应；真实 provider 的模型行为
-  （提示词遵从度、字段漂移、长上下文截断）未经任何验证。
+- **[T19] 真实 provider 覆盖仍薄**：stub 只覆盖"形状正确"；真实 provider 现已实测
+  （维基百科搜索任务 × 2 次 + doctor 探测 × 1 次，模型 `deepseek-flash`），
+  但**只覆盖单一模型、单一任务**；提示词遵从度、字段漂移、长上下文截断、
+  其他 provider（OpenAI / 兼容网关）均未系统验证。
 
 ### Notes
 

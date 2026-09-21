@@ -322,9 +322,10 @@ python3 examples/llm_stub_demo.py --fail-first 1  # stub 首次回 503 → 验�
 python3 examples/llm_stub_demo.py --out-of-range  # stub 回越界编号 999 → 验证降 margin
 ```
 
-**定性说明**：这是 **wiring 验证**，**不是 T2 闭环**——stub 只证明"链路与形状"，
-真实 provider 的模型行为仍待用户提供 key 后验证。stub 不落任何凭证、结束即释放端口，
-demo 用的 `LLM_API_KEY` 就是字面量 `stub`。
+**定性说明**：stub 验证的是**接线**（真实 HTTP / 解析 / 重试 / 主循环），
+**它本身不等于 T2 闭环**——闭环依据是真实 provider 的端到端实测
+（见上面「已知局限」里 T2 的 ✅ 记录与 CHANGELOG 的 Closed 段）。
+stub 不落任何凭证、结束即释放端口，demo 用的 `LLM_API_KEY` 就是字面量 `stub`。
 
 **按钮型**（`examples/local_order_form.html`，8/8 通过）：
 
@@ -367,12 +368,16 @@ C 是"逐个过门"的关键证据：安全门是**每个动作各自**过门，
   始终不去点结果链接。拆成两个单目标任务（先搜索、再打开）即可正常终止：
   单目标任务「搜索 X」在第 2 步 `done=0.63 ≥ 0.50` 正常 `finished`。
   根因即上面 T9 + T10 两条叠加。改进方向：分阶段子目标，或按任务显式指定"打开第 N 个结果"。
-- **[T2] LLM 兜底：wiring 已验证 / 真实 provider 待 key**（两段，别混为一谈）
-  - **wiring 已验证**：本地 stub（`python3 examples/llm_stub_demo.py`）跑通真实 HTTP + 真实解析
-    + 真实重试 + 真实主循环 + 真实 chromium 执行；断言 `source=="llm"`、`llm_fallback.used>0`、
-    `need_llm==False`、stub 首次 503 时 `Decision.retries==1`。
-  - **真实 provider 端到端待 key**：未用任何真实 provider 验证过"低 margin → LLM 接管"，
-    所以 **T2 未闭环**，stub 验证不能当作完成。
+- **[T2] LLM 兜底端到端 —— 已闭环 ✅**（已不再是局限；保留条目以指向证据，全文见 CHANGELOG 的 Closed 段）
+  - **真实 provider 段（闭环依据，实测）**：用户提供真实 key 后两段验证都成立 ——
+    ① 强制升级（`JEV_ROUTE_T=0.95`）：`status=finished`、`llm_fallback.used=3`，
+    每一步 `source="llm"` 且 `need_llm=False`（不二次升级），LLM 选中的目标与 Jev 一致
+    （同一个搜索框）并真实打开了词条（`final.title=人工智能 - Wikipedia`）；
+    ② 默认阈值（`JEV_ROUTE_T=0.30`）：`used=0`、`source="jev"` —— **LLM 成本为 0**。
+    结论与阈值校准一致：Jev 有把握时不调用 LLM，只有 `margin < 0.30` 才升级。
+  - **wiring 段（补充说明，保留）**：本地 stub（`python3 examples/llm_stub_demo.py`）在**无 key**
+    环境下跑通真实 HTTP + 真实解析 + 真实重试 + 真实主循环 + 真实 chromium 执行。
+    **它本身不等于闭环**，只是让"接线"可被回归。
 
 ## License
 

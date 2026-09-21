@@ -140,11 +140,14 @@ Jev 的 `done` 问的是「**结合历史操作，该任务是否已经完成**�
 | `execution` | obj | 执行器结果（见上「执行器」节结构表） |
 | `snapshot` | obj | 动作后的 `{url, title}` |
 
-### LLM 兜底（wiring 已用本地 stub 验证，真实 provider 待 key）
+### LLM 兜底（wiring + 真实 provider 均已验证）
 
-`examples/llm_stub_demo.py` 提供只监听 127.0.0.1 的 OpenAI 兼容 stub，用于在**没有 LLM key**
-的情况下验证这条链路：真实 HTTP、真实解析、真实重试、真实主循环。它验证的是**接线**，
-不是真实模型行为（见 CHANGELOG 的 T2 两段说明与 T19）。
+- **真实 provider**：已用真实 key 跑通"强制升级 → LLM 接管 → 不二次升级"与
+  "默认阈值 → 不调用 LLM"两段（证据见 CHANGELOG 的 Closed 段）。
+  即 `brain_llm.ask` → `parse_llm_answer` → 主循环落地这条真实链路已闭环。
+- **wiring（无凭证回归）**：`examples/llm_stub_demo.py` 提供只监听 127.0.0.1 的 OpenAI 兼容 stub，
+  在**没有 LLM key** 的情况下也能验证真实 HTTP / 解析 / 重试 / 主循环。
+  它验证的是**接线**，不能替代真实模型行为（覆盖仍薄，见 T19）。
 
 ### 其他 phase
 
